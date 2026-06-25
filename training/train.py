@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+"""Training entry point for the NMS-Free detector."""
+
+from __future__ import annotations
+
+import argparse
+import math
+import os
+from copy import deepcopy
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+from torch.cuda.amp import GradScaler
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
+import yaml
+
+from models import NMSFreeDetector
+from losses import HungarianCriterion
+from losses.hungarian import HungarianMatcher
+from datasets import build_dataloader
+from utils import MeanAveragePrecision
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser("ViTServer NMS-Free Detector Trainer")
+    p.add_argument("--config", default="configs/custom_model.yaml")
+    p.add_argument("--data_path", required=True)
+    p.add_argument("--img_size", type=int, default=1280)
+    p.add_argument("--resume", default="")
+    p.add_argument("--device", default="cuda")
+    return p.parse_args()
+
+
+def build_model_and_criterion(cfg: dict, device: torch.device):
+    model_cfg = cfg["model"]
+    model = NMSFreeDetector(
+        num_classes=model_cfg["num_classes"],
+        base_channels=model_cfg["base_channels"],
+        embed_dim=model_cfg["embed_dim"],
+        num_heads=model_cfg["num_heads"],
+        num_encoder_layers=model_cfg["num_encoder_layers"],
+        num_decoder_layers=model_cfg["num_decoder_layers"],
+        num_queries=model_cfg["num_queries"],
+        dropout=model_cfg["dropout"],
+        aux_loss=model_cfg["aux_loss"],
+    ).to(device)
+
+    lc = cfg["loss"]
+    matcher = HungarianMatcher(lc["matcher_cls_weight"], lc["matcher_bbox_weight"], lc["matcher_giou_weight"])
+    criterion = HungarianCriterion(
+        num_classes=model_cfg["num_classes"],
+        matcher=matcher,
+        cls_weight=lc["cls_weight"],
+        bbox_weight=lc["bbox_weight"],
+        giou_weight=lc["giou_weight"],
+        focal_alpha=lc["focal_alpha"],
+        focal_gamma=lc["focal_gamma"],
+    ).to(device)
+
+    return model, criterion
+
+
+def train_one_epoch(
+    model: nn.Module,
+    criterion: nn.Module,
+    loader,
+    optimizer: torch.optim.Optimizer,
+    scaler: GradScaler,
+    device: torch.device,
+    epoch: int,
+    grad_accum: int = 1,
+    clip_norm: float = 0.1,
+) -> dict[str, float]:
+    model.train()
+    criterion.train()
+    totals: dict[str, float] = {}
+    optimizer.zero_grad()
+
+    for step, (images, targets) in enumerate(tqdm(loader, desc=f"Epoch {epoch}")):
+        images = images.to(device, non_blocking=True)
+        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+
+        with torch.cuda.amp.autocast():
+            outputs = model(images)
+            losses = criterion(outputs, targets)
+
+        loss = losses["total"] / grad_accum
+        scaler.scale(loss).backward()
+
+        if (step + 1) % grad_accum == 0:
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+
+        for k, v in losses.items():
+            totals[k] = totals.get(k, 0.0) + v.item()
+
+    n = len(loader)
+    return {k: v / n for k, v in totals.items()}
+
+
+@torch.no_grad()
+def validate(
+    model: nn.Module,
+    loader,
+    device: torch.device,
+    ann_file: str,
+) -> dict[str, float]:
+    model.eval()
+    metric = MeanAveragePrecision(ann_file)
+    for images, targets in tqdm(loader, desc="Val"):
+        images = images.to(device, non_blocking=True)
+        with torch.cuda.amp.autocast():
+            out = model(images)
+        scores = out["pred_logits"].sigmoid()
+        ids = [t["image_id"].item() for t in targets]
+        orig = torch.stack([t["orig_size"] for t in targets])
+        metric.update(out["pred_boxes"].cpu(), scores.cpu(), ids, orig)
+    return metric.compute()
+
+
+class EMA:
+    def __init__(self, model: nn.Module, decay: float = 0.9999) -> None:
+        self.ema = deepcopy(model).eval()
+        self.decay = decay
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        for ema_p, p in zip(self.ema.parameters(), model.parameters()):
+            ema_p.mul_(self.decay).add_(p.data, alpha=1 - self.decay)
+
+
+def main() -> None:
+    args = parse_args()
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+
+    with open(args.config) as f:
+        cfg = yaml.safe_load(f)
+
+    dc = cfg["data"]
+    tc = cfg["training"]
+    lc = cfg["logging"]
+
+    train_loader = build_dataloader(
+        os.path.join(args.data_path, dc["train_img_dir"]),
+        os.path.join(args.data_path, dc["train_ann"]),
+        img_size=args.img_size,
+        batch_size=tc["batch_size"],
+        num_workers=dc["num_workers"],
+        train=True,
+    )
+    val_loader = build_dataloader(
+        os.path.join(args.data_path, dc["val_img_dir"]),
+        os.path.join(args.data_path, dc["val_ann"]),
+        img_size=args.img_size,
+        batch_size=tc["batch_size"],
+        num_workers=dc["num_workers"],
+        train=False,
+    )
+
+    model, criterion = build_model_and_criterion(cfg, device)
+
+    param_groups = [
+        {"params": model.backbone.parameters(), "lr": tc["lr_backbone"]},
+        {"params": [p for n, p in model.named_parameters() if "backbone" not in n], "lr": tc["lr"]},
+    ]
+    optimizer = AdamW(param_groups, weight_decay=tc["weight_decay"])
+    scheduler = CosineAnnealingLR(optimizer, T_max=tc["epochs"], eta_min=tc["lr"] * 1e-2)
+    scaler = GradScaler(enabled=tc["amp"])
+    ema = EMA(model, tc["ema_decay"]) if tc["ema"] else None
+
+    save_dir = Path(lc["save_dir"]) / lc["project"]
+    save_dir.mkdir(parents=True, exist_ok=True)
+    writer = SummaryWriter(save_dir / "tb")
+
+    start_epoch = 0
+    best_map = 0.0
+
+    if args.resume:
+        ckpt = torch.load(args.resume, map_location=device)
+        model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        start_epoch = ckpt["epoch"] + 1
+        best_map = ckpt.get("best_map", 0.0)
+        print(f"Resumed from epoch {start_epoch}")
+
+    for epoch in range(start_epoch, tc["epochs"]):
+        train_metrics = train_one_epoch(
+            model, criterion, train_loader, optimizer, scaler, device, epoch,
+            grad_accum=tc["grad_accumulate"],
+            clip_norm=tc["clip_grad_norm"],
+        )
+        scheduler.step()
+
+        if ema:
+            ema.update(model)
+
+        for k, v in train_metrics.items():
+            writer.add_scalar(f"train/{k}", v, epoch)
+
+        if (epoch + 1) % lc["val_period"] == 0:
+            eval_model = ema.ema if ema else model
+            val_metrics = validate(eval_model, val_loader, device, os.path.join(args.data_path, dc["val_ann"]))
+            for k, v in val_metrics.items():
+                writer.add_scalar(f"val/{k}", v, epoch)
+            print(f"Epoch {epoch} | {val_metrics}")
+
+            if val_metrics["mAP"] > best_map:
+                best_map = val_metrics["mAP"]
+                torch.save({"model": model.state_dict(), "epoch": epoch, "best_map": best_map}, save_dir / "best.pt")
+
+        if (epoch + 1) % lc["save_period"] == 0:
+            torch.save({
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "epoch": epoch,
+                "best_map": best_map,
+            }, save_dir / f"epoch_{epoch}.pt")
+
+    writer.close()
+    print(f"Training complete. Best mAP: {best_map:.4f}")
+
+
+if __name__ == "__main__":
+    main()

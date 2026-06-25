@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.env
+
+# Training artefacts
+training/runs/
+training/weights/
+training/*.pt
+training/*.pth
+training/*.onnx
+training/wandb/
+
+# C++ build
+inference-server/build/
+inference-server/*.trt
+inference-server/*.engine
+*.o
+*.a
+
+# Datasets
+data/
+datasets/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

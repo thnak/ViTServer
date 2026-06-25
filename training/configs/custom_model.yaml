@@ -1,0 +1,53 @@
+# ViTServer — NMS-Free Detector Config
+
+model:
+  img_size: 1280
+  in_channels: 3
+  base_channels: 64          # CNN backbone channel multiplier
+  embed_dim: 256             # Transformer embedding dimension
+  num_heads: 8
+  num_encoder_layers: 1      # Scale-aware intra-scale encoder layers
+  num_decoder_layers: 6
+  num_queries: 300           # Object query slots
+  num_classes: 80            # COCO default; override for custom datasets
+  dropout: 0.0
+  aux_loss: true             # Auxiliary losses on intermediate decoder layers
+
+training:
+  epochs: 500
+  batch_size: 4
+  grad_accumulate: 4         # Effective batch = batch_size × grad_accumulate
+  optimizer: adamw
+  lr: 1.0e-4
+  lr_backbone: 1.0e-5
+  weight_decay: 1.0e-4
+  lr_scheduler: cosine
+  warmup_epochs: 10
+  ema: true
+  ema_decay: 0.9999
+  amp: true                  # Automatic Mixed Precision (fp16)
+  clip_grad_norm: 0.1
+
+loss:
+  cls_weight: 2.0
+  bbox_weight: 5.0
+  giou_weight: 2.0
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+  matcher_cls_weight: 2.0
+  matcher_bbox_weight: 5.0
+  matcher_giou_weight: 2.0
+
+data:
+  train_ann: annotations/instances_train2017.json
+  val_ann: annotations/instances_val2017.json
+  train_img_dir: images/train2017
+  val_img_dir: images/val2017
+  num_workers: 8
+  pin_memory: true
+
+logging:
+  project: vitserver
+  save_dir: runs/
+  save_period: 10            # Save checkpoint every N epochs
+  val_period: 5
