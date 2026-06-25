@@ -38,12 +38,20 @@ ViTServer/
 cd training
 pip install -r requirements.txt
 
-# Train
-python train.py --config configs/custom_model.yaml \
-                --data_path /path/to/dataset \
-                --img_size 1280
+# 1. Download COCO 2017 (train ~18 GB + val ~1 GB + annotations ~241 MB)
+python scripts/download_coco.py            # → data/coco/
+#   or with a custom path:
+python scripts/download_coco.py --dest /data/coco
 
-# Export ONNX (dynamic shapes + NHWC)
+# 2. Train (--data_path defaults to data/coco)
+python train.py --config configs/custom_model.yaml --img_size 1280
+#   or with a custom path:
+python train.py --data_path /data/coco
+
+#   Skip validation for faster iteration:
+python train.py --no-val
+
+# 3. Export ONNX (dynamic shapes + NHWC)
 python export.py --weights best.pt --format onnx --dynamic
 ```
 

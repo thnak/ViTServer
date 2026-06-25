@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import math
-import os
 from copy import deepcopy
 from pathlib import Path
 
@@ -28,10 +27,16 @@ from utils import MeanAveragePrecision
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser("ViTServer NMS-Free Detector Trainer")
     p.add_argument("--config", default="configs/custom_model.yaml")
-    p.add_argument("--data_path", required=True)
+    p.add_argument(
+        "--data_path",
+        default="data/coco",
+        help="Root of COCO dataset (default: data/coco). "
+             "Run scripts/download_coco.py first if not present.",
+    )
     p.add_argument("--img_size", type=int, default=1280)
     p.add_argument("--resume", default="")
     p.add_argument("--device", default="cuda")
+    p.add_argument("--no-val", action="store_true", help="Skip validation (faster iteration)")
     return p.parse_args()
 
 
@@ -147,22 +152,31 @@ def main() -> None:
     tc = cfg["training"]
     lc = cfg["logging"]
 
+    data_root = Path(args.data_path)
+    if not data_root.exists():
+        raise SystemExit(
+            f"Dataset not found at '{data_root}'.\n"
+            "Run:  python scripts/download_coco.py --dest " + str(data_root)
+        )
+
     train_loader = build_dataloader(
-        os.path.join(args.data_path, dc["train_img_dir"]),
-        os.path.join(args.data_path, dc["train_ann"]),
+        str(data_root / dc["train_img_dir"]),
+        str(data_root / dc["train_ann"]),
         img_size=args.img_size,
         batch_size=tc["batch_size"],
         num_workers=dc["num_workers"],
         train=True,
     )
-    val_loader = build_dataloader(
-        os.path.join(args.data_path, dc["val_img_dir"]),
-        os.path.join(args.data_path, dc["val_ann"]),
-        img_size=args.img_size,
-        batch_size=tc["batch_size"],
-        num_workers=dc["num_workers"],
-        train=False,
-    )
+    val_loader = None
+    if not args.no_val:
+        val_loader = build_dataloader(
+            str(data_root / dc["val_img_dir"]),
+            str(data_root / dc["val_ann"]),
+            img_size=args.img_size,
+            batch_size=tc["batch_size"],
+            num_workers=dc["num_workers"],
+            train=False,
+        )
 
     model, criterion = build_model_and_criterion(cfg, device)
 
@@ -204,9 +218,9 @@ def main() -> None:
         for k, v in train_metrics.items():
             writer.add_scalar(f"train/{k}", v, epoch)
 
-        if (epoch + 1) % lc["val_period"] == 0:
+        if not args.no_val and (epoch + 1) % lc["val_period"] == 0:
             eval_model = ema.ema if ema else model
-            val_metrics = validate(eval_model, val_loader, device, os.path.join(args.data_path, dc["val_ann"]))
+            val_metrics = validate(eval_model, val_loader, device, str(data_root / dc["val_ann"]))
             for k, v in val_metrics.items():
                 writer.add_scalar(f"val/{k}", v, epoch)
             print(f"Epoch {epoch} | {val_metrics}")
