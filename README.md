@@ -90,8 +90,8 @@ Recommended serving hardware per variant. FPS estimates assume TensorRT FP16, si
 cd training
 
 # Set up Python environment (requires uv)
-uv venv && uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
-uv pip install albumentations pycocotools onnx onnxscript
+uv venv && uv pip install torch --index-url https://download.pytorch.org/whl/cpu
+uv pip install -r requirements.txt
 
 # 1. Download COCO 2017 (~19 GB total)
 uv run python scripts/download_coco.py            # → data/coco/
