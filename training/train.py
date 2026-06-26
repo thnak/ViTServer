@@ -62,6 +62,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--resume", default="")
     p.add_argument("--device", default="cuda")
     p.add_argument("--no-val", action="store_true", help="Skip validation (faster iteration)")
+    p.add_argument("--compile", action="store_true", help="torch.compile the model (CUDA only, ~10-30%% faster)")
+    p.add_argument("--compile-mode", default="reduce-overhead",
+                   choices=["default", "reduce-overhead", "max-autotune"],
+                   help="torch.compile mode (default: reduce-overhead)")
     return p.parse_args()
 
 
@@ -230,6 +234,10 @@ def main() -> None:
         )
 
     model, criterion = build_model_and_criterion(cfg, device)
+
+    if args.compile and device.type == "cuda":
+        print(f"Compiling model with mode='{args.compile_mode}' (first batch will be slow) …")
+        model = torch.compile(model, mode=args.compile_mode)
 
     param_groups = [
         {"params": model.backbone.parameters(), "lr": tc["lr_backbone"]},
