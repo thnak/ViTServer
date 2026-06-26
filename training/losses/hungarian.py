@@ -107,11 +107,14 @@ class HungarianCriterion(nn.Module):
         indices: list[tuple[Tensor, Tensor]],
     ) -> Tensor:
         B, Q, C = logits.shape
-        tgt_cls = torch.zeros(B, Q, C, device=logits.device)
+        # Build on CPU as a fixed [B, Q, C] tensor, then transfer once.
+        # Avoids variable-length scatter directly into an XLA tensor which
+        # changes shape every step and forces XLA to recompile the graph.
+        tgt_cls = torch.zeros(B, Q, C)
         for b, (pi, ti) in enumerate(indices):
             if len(pi):
-                tgt_cls[b, pi, targets[b]["labels"][ti]] = 1.0
-        return sigmoid_focal_loss(logits, tgt_cls, self.focal_alpha, self.focal_gamma)
+                tgt_cls[b, pi, targets[b]["labels"].cpu()[ti]] = 1.0
+        return sigmoid_focal_loss(logits, tgt_cls.to(logits.device), self.focal_alpha, self.focal_gamma)
 
     def _loss_boxes(
         self,
@@ -119,17 +122,20 @@ class HungarianCriterion(nn.Module):
         targets: list[dict],
         indices: list[tuple[Tensor, Tensor]],
     ) -> tuple[Tensor, Tensor]:
-        preds, gts = [], []
+        B, Q, _ = pred_boxes.shape
+        # Fixed-shape [B*Q, 4] target tensor + boolean mask — same shape every step.
+        tgt = torch.zeros(B * Q, 4)
+        mask = torch.zeros(B * Q)
         for b, (pi, ti) in enumerate(indices):
             if len(pi):
-                preds.append(pred_boxes[b, pi])
-                gts.append(targets[b]["boxes"][ti].to(pred_boxes.device))
-        if not preds:
-            z = pred_boxes.new_tensor(0.0)
-            return z, z
-        preds = torch.cat(preds)
-        gts = torch.cat(gts)
-        return l1_loss(preds, gts).sum(), ciou_loss(preds, gts).sum()
+                flat = b * Q + pi
+                tgt[flat] = targets[b]["boxes"].cpu()[ti]
+                mask[flat] = 1.0
+        dev = pred_boxes.device
+        tgt = tgt.to(dev)
+        mask = mask.to(dev)
+        p = pred_boxes.reshape(-1, 4)
+        return (l1_loss(p, tgt) * mask).sum(), (ciou_loss(p, tgt) * mask).sum()
 
     def forward(
         self,
@@ -137,7 +143,8 @@ class HungarianCriterion(nn.Module):
         targets: list[dict],
     ) -> dict[str, Tensor]:
         indices = self.matcher(outputs["pred_logits"], outputs["pred_boxes"], targets)
-        num_boxes = max(1, sum(len(t["labels"]) for t in targets))
+        # Use CPU indices (already on CPU from matcher) — avoids len() on XLA tensors
+        num_boxes = max(1, sum(len(pi) for pi, _ in indices))
 
         l1, ciou = self._loss_boxes(outputs["pred_boxes"], targets, indices)
         cls = self._loss_labels(outputs["pred_logits"], targets, indices)
@@ -151,11 +158,12 @@ class HungarianCriterion(nn.Module):
         if "aux_outputs" in outputs:
             for i, aux in enumerate(outputs["aux_outputs"]):
                 idx = self.matcher(aux["pred_logits"], aux["pred_boxes"], targets)
+                aux_boxes = max(1, sum(len(pi) for pi, _ in idx))
                 l1a, cioua = self._loss_boxes(aux["pred_boxes"], targets, idx)
                 clsa = self._loss_labels(aux["pred_logits"], targets, idx)
-                losses[f"aux_{i}_loss_cls"] = clsa / num_boxes * self.cls_w
-                losses[f"aux_{i}_loss_l1"] = l1a / num_boxes * self.bbox_w
-                losses[f"aux_{i}_loss_ciou"] = cioua / num_boxes * self.giou_w
+                losses[f"aux_{i}_loss_cls"] = clsa / aux_boxes * self.cls_w
+                losses[f"aux_{i}_loss_l1"] = l1a / aux_boxes * self.bbox_w
+                losses[f"aux_{i}_loss_ciou"] = cioua / aux_boxes * self.giou_w
 
         losses["total"] = sum(losses.values())
         return losses
