@@ -15,15 +15,12 @@ _MAX_T = 100
 
 
 class HungarianMatcher(nn.Module):
-    """Compute optimal bipartite matching between predictions and padded targets.
-
-    Returns fixed-size (pi, ti, valid) tuples — [_MAX_T] CPU tensors — so the
-    downstream criterion only ever sees constant-shape index tensors on device.
-    """
+    """Bipartite matching on CPU.  Returns fixed-size [_MAX_T] index tensors so
+    every downstream transfer and gather has the same shape every step."""
 
     def __init__(
         self,
-        cls_weight: float = 2.0,
+        cls_weight:  float = 2.0,
         bbox_weight: float = 5.0,
         giou_weight: float = 2.0,
     ) -> None:
@@ -37,9 +34,9 @@ class HungarianMatcher(nn.Module):
         self,
         pred_logits: Tensor,   # [B, Q, C]
         pred_boxes:  Tensor,   # [B, Q, 4]
-        targets: list[dict],   # padded: labels/boxes [MAX_T], valid [MAX_T]
+        targets: list[dict],   # padded targets: labels/boxes [MAX_T], valid [MAX_T]
     ) -> list[tuple[Tensor, Tensor, Tensor]]:
-        # Entire cost computation on CPU — single host boundary, no mid-graph syncs.
+        """Returns list of (pi, ti, valid) — all [_MAX_T] on CPU."""
         pred_logits = pred_logits.detach().float().cpu()
         pred_boxes  = pred_boxes.detach().float().cpu()
         B, Q, C = pred_logits.shape
@@ -50,9 +47,9 @@ class HungarianMatcher(nn.Module):
             ti_pad = torch.zeros(_MAX_T, dtype=torch.long)
             v_pad  = torch.zeros(_MAX_T, dtype=torch.bool)
 
-            valid_cpu = targets[b]["valid"].cpu()              # [MAX_T]
-            tgt_cls   = targets[b]["labels"].cpu()[valid_cpu]  # [M]
-            tgt_boxes = targets[b]["boxes"].cpu()[valid_cpu]   # [M, 4]
+            valid_cpu = targets[b]["valid"].cpu()
+            tgt_cls   = targets[b]["labels"].cpu()[valid_cpu]   # [M]
+            tgt_boxes = targets[b]["boxes"].cpu()[valid_cpu]    # [M, 4]
             M = len(tgt_cls)
 
             if M > 0:
@@ -86,18 +83,20 @@ class HungarianMatcher(nn.Module):
 
 
 class HungarianCriterion(nn.Module):
-    """Full loss with Hungarian matching + CIoU + Focal.
+    """Loss = Focal + L1 + CIoU with Hungarian assignment.
 
-    Targets are expected to be pre-padded to MAX_TARGETS by the dataloader's
-    collate_fn.  All loss ops use fixed-shape [MAX_T] index tensors so XLA
-    compiles the graph exactly once, regardless of how many GT boxes each
-    image contains.
+    Targets arrive pre-padded to MAX_TARGETS (from collate_fn).  All loss ops
+    are fully batched — no Python loops over the batch dimension in forward — so
+    XLA compiles the graph once and reuses it every step.
+
+    Configure via YAML loss block; no device flag needed: fixed-shape batch
+    ops work identically on CUDA and XLA.
     """
 
     def __init__(
         self,
-        num_classes: int,
-        matcher: HungarianMatcher,
+        num_classes:  int,
+        matcher:      HungarianMatcher,
         cls_weight:   float = 2.0,
         bbox_weight:  float = 5.0,
         giou_weight:  float = 2.0,
@@ -113,50 +112,42 @@ class HungarianCriterion(nn.Module):
         self.focal_alpha = focal_alpha
         self.focal_gamma = focal_gamma
 
-    # ── internal helpers ────────────────────────────────────────────────────
+    # ── batched loss kernels ────────────────────────────────────────────────
+    # All inputs are on-device tensors with fixed shapes — same every step.
 
     def _loss_labels(
         self,
-        logits:  Tensor,
-        targets: list[dict],
-        indices: list[tuple[Tensor, Tensor, Tensor]],
+        logits:  Tensor,   # [B, Q, C]
+        labels:  Tensor,   # [B, MAX_T] — pre-padded target labels on device
+        pi:      Tensor,   # [B, MAX_T] — matched query indices
+        ti:      Tensor,   # [B, MAX_T] — matched target indices
+        valid:   Tensor,   # [B, MAX_T] bool
     ) -> Tensor:
         B, Q, C = logits.shape
-        dev     = logits.device
-        tgt_cls = logits.new_zeros(B, Q, C)  # [B, Q, C] on device — always same shape
-
-        for b, (pi, ti, valid) in enumerate(indices):
-            pi_d    = pi.to(dev)                         # [MAX_T]
-            ti_d    = ti.to(dev)                         # [MAX_T]
-            valid_f = valid.to(dev).to(logits.dtype)     # [MAX_T]
-
-            labs     = targets[b]["labels"][ti_d]        # [MAX_T] — fixed-shape gather
-            flat_idx = pi_d * C + labs                   # [MAX_T] — flat (query, class) index
-            tgt_cls[b].view(-1).scatter_add_(0, flat_idx, valid_f)
-
-        return sigmoid_focal_loss(logits, tgt_cls, self.focal_alpha, self.focal_gamma)
+        labs     = labels.gather(1, ti)              # [B, MAX_T] — batched gather
+        flat_idx = pi * C + labs                     # [B, MAX_T] — flat (q, cls) index
+        valid_f  = valid.to(logits.dtype)            # [B, MAX_T]
+        tgt_cls  = logits.new_zeros(B, Q * C)        # [B, Q*C]
+        tgt_cls.scatter_add_(1, flat_idx, valid_f)   # single batched scatter
+        return sigmoid_focal_loss(logits, tgt_cls.view(B, Q, C), self.focal_alpha, self.focal_gamma)
 
     def _loss_boxes(
         self,
-        pred_boxes: Tensor,
-        targets:    list[dict],
-        indices:    list[tuple[Tensor, Tensor, Tensor]],
+        pred_boxes: Tensor,   # [B, Q, 4]
+        boxes:      Tensor,   # [B, MAX_T, 4] — pre-padded target boxes on device
+        pi:         Tensor,   # [B, MAX_T]
+        ti:         Tensor,   # [B, MAX_T]
+        valid:      Tensor,   # [B, MAX_T] bool
     ) -> tuple[Tensor, Tensor]:
-        dev        = pred_boxes.device
-        total_l1   = pred_boxes.new_tensor(0.0)
-        total_ciou = pred_boxes.new_tensor(0.0)
+        B = pred_boxes.shape[0]
+        pi_exp = pi.unsqueeze(-1).expand(-1, -1, 4)  # [B, MAX_T, 4]
+        ti_exp = ti.unsqueeze(-1).expand(-1, -1, 4)  # [B, MAX_T, 4]
+        p      = pred_boxes.gather(1, pi_exp).view(B * _MAX_T, 4)  # batched gather → flat
+        t      = boxes.gather(1, ti_exp).view(B * _MAX_T, 4)
+        vf     = valid.to(pred_boxes.dtype).view(B * _MAX_T)
+        return (l1_loss(p, t) * vf).sum(), (ciou_loss(p, t) * vf).sum()
 
-        for b, (pi, ti, valid) in enumerate(indices):
-            pi_d    = pi.to(dev)                     # [MAX_T]
-            ti_d    = ti.to(dev)                     # [MAX_T]
-            valid_f = valid.float().to(dev)          # [MAX_T]
-
-            p = pred_boxes[b, pi_d]                  # [MAX_T, 4] — fixed-shape gather
-            t = targets[b]["boxes"][ti_d]            # [MAX_T, 4] — fixed-shape gather
-            total_l1   = total_l1   + (l1_loss(p, t)   * valid_f).sum()
-            total_ciou = total_ciou + (ciou_loss(p, t) * valid_f).sum()
-
-        return total_l1, total_ciou
+    # ── orchestration ────────────────────────────────────────────────────────
 
     def _compute(
         self,
@@ -167,16 +158,26 @@ class HungarianCriterion(nn.Module):
         num_boxes:   int,
         prefix:      str = "",
     ) -> dict[str, Tensor]:
-        l1, ciou = self._loss_boxes(pred_boxes, targets, indices)
-        cls      = self._loss_labels(pred_logits, targets, indices)
+        dev = pred_logits.device
+
+        # Stack CPU index tensors → one [B, MAX_T] transfer each
+        pi    = torch.stack([p      for p, _, _ in indices]).to(dev)
+        ti    = torch.stack([t      for _, t, _ in indices]).to(dev)
+        valid = torch.stack([v      for _, _, v in indices]).to(dev)
+
+        # Stack on-device target tensors — batched, fixed shape, no data copy
+        labels = torch.stack([t["labels"] for t in targets])   # [B, MAX_T]
+        boxes  = torch.stack([t["boxes"]  for t in targets])   # [B, MAX_T, 4]
+
+        cls      = self._loss_labels(pred_logits, labels, pi, ti, valid)
+        l1, ciou = self._loss_boxes(pred_boxes, boxes, pi, ti, valid)
+
         p = f"{prefix}_" if prefix else ""
         return {
             f"{p}loss_cls":  cls  / num_boxes * self.cls_w,
             f"{p}loss_l1":   l1   / num_boxes * self.bbox_w,
             f"{p}loss_ciou": ciou / num_boxes * self.giou_w,
         }
-
-    # ── public ──────────────────────────────────────────────────────────────
 
     def forward(self, outputs: dict, targets: list[dict]) -> dict[str, Tensor]:
         indices   = self.matcher(outputs["pred_logits"], outputs["pred_boxes"], targets)
