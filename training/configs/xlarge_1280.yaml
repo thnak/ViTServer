@@ -1,0 +1,57 @@
+# ViTServer — xlarge tier @ 1280×1280 (51.1 M params, 2 628 GFLOPs)
+# Target: Cloud — A100 / H100 80 GB (TRT FP16, batch ≥ 4, accuracy-first)
+# Train: python train.py --config configs/xlarge_1280.yaml --device cuda
+
+model:
+  img_size: 1280
+  in_channels: 3
+  base_channels: 96
+  embed_dim: 512
+  num_heads: 16
+  encoder_type: none
+  num_encoder_layers: 0
+  window_size: 8
+  num_decoder_layers: 6
+  num_queries: 300
+  num_classes: 80
+  dropout: 0.0
+  aux_loss: true
+
+training:
+  epochs: 500
+  batch_size: 1
+  grad_accumulate: 16            # effective batch = 16; 1280 px is very memory-hungry
+  optimizer: adamw
+  lr: 1.0e-4
+  lr_backbone: 1.0e-5
+  weight_decay: 1.0e-4
+  lr_scheduler: cosine
+  warmup_epochs: 10
+  ema: true
+  ema_decay: 0.9999
+  amp: true
+  clip_grad_norm: 0.1
+
+loss:
+  cls_weight: 2.0
+  bbox_weight: 5.0
+  giou_weight: 2.0
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+  matcher_cls_weight: 2.0
+  matcher_bbox_weight: 5.0
+  matcher_giou_weight: 2.0
+
+data:
+  train_ann: annotations/instances_train2017.json
+  val_ann: annotations/instances_val2017.json
+  train_img_dir: images/train2017
+  val_img_dir: images/val2017
+  num_workers: 8
+  pin_memory: true
+
+logging:
+  project: xlarge_1280
+  save_dir: runs/
+  save_period: 10
+  val_period: 5
