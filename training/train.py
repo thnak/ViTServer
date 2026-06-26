@@ -118,7 +118,8 @@ def train_one_epoch(
     totals: dict[str, float] = {}
     optimizer.zero_grad()
 
-    for step, (images, targets) in enumerate(tqdm(loader, desc=f"Epoch {epoch}")):
+    pbar = tqdm(loader, desc=f"Epoch {epoch}")
+    for step, (images, targets) in enumerate(pbar):
         images = images.to(device, non_blocking=True)
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
@@ -148,6 +149,8 @@ def train_one_epoch(
 
         for k, v in losses.items():
             totals[k] = totals.get(k, 0.0) + v.item()
+
+        pbar.set_postfix({k: f"{v / (step + 1):.4f}" for k, v in totals.items()})
 
     n = len(loader)
     return {k: v / n for k, v in totals.items()}
@@ -284,6 +287,9 @@ def main() -> None:
 
         if ema:
             ema.update(model)
+
+        loss_str = "  ".join(f"{k}: {v:.4f}" for k, v in train_metrics.items())
+        print(f"Epoch {epoch} | {loss_str}")
 
         for k, v in train_metrics.items():
             writer.add_scalar(f"train/{k}", v, epoch)
