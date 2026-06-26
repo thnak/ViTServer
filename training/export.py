@@ -17,7 +17,8 @@ from models.transformer import MultiheadAttentionONNX
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser("Export NMS-Free Detector to ONNX")
-    p.add_argument("--weights", required=True, help="Path to .pt checkpoint")
+    p.add_argument("--weights", "--checkpoint", required=True, dest="weights",
+                   help="Path to .pt checkpoint")
     p.add_argument("--config", default="configs/custom_model.yaml")
     p.add_argument("--format", default="onnx", choices=["onnx"])
     p.add_argument("--dynamic", action="store_true", help="Dynamic batch + spatial axes")
@@ -126,10 +127,15 @@ def main() -> None:
             dynamo=False,          # use TorchScript path; torch.export fails on 1×1 spatial dims
         )
 
-    # Verify
+    # Shape inference — populates type/shape on every intermediate value so
+    # graph viewers (Netron) can display tensor shapes throughout the network.
+    print("Running ONNX shape inference ...")
     model_onnx = onnx.load(out_path)
     onnx.checker.check_model(model_onnx)
+    model_onnx = onnx.shape_inference.infer_shapes(model_onnx)
+    onnx.save(model_onnx, out_path)
 
+    # ORT round-trip verification
     sess = ort.InferenceSession(out_path, providers=["CPUExecutionProvider"])
     feed = {sess.get_inputs()[0].name: dummy.numpy()}
     boxes, scores = sess.run(None, feed)
