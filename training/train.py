@@ -236,8 +236,15 @@ def main() -> None:
     model, criterion = build_model_and_criterion(cfg, device)
 
     if args.compile and device.type == "cuda":
-        print(f"Compiling model with mode='{args.compile_mode}' (first batch will be slow) …")
-        model = torch.compile(model, mode=args.compile_mode)
+        import platform
+        if platform.system() == "Linux":
+            print(f"Compiling model with mode='{args.compile_mode}' (first batch will be slow) …")
+            model = torch.compile(model, mode=args.compile_mode)
+        else:
+            # Triton (required by inductor modes) has no Windows wheels;
+            # aot_eager captures the graph and speeds up autograd without Triton.
+            print("torch.compile: Triton not available on Windows — using backend='aot_eager'")
+            model = torch.compile(model, backend="aot_eager")
 
     param_groups = [
         {"params": model.backbone.parameters(), "lr": tc["lr_backbone"]},
