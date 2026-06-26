@@ -34,8 +34,10 @@ def _resolve_device(device_arg: str) -> tuple[torch.device, Optional[Callable]]:
     """
     if device_arg == "tpu":
         try:
+            import torch_xla
             import torch_xla.core.xla_model as xm
-            return xm.xla_device(), xm.mark_step
+            dev = torch_xla.device()
+            return dev, xm.mark_step
         except ImportError:
             raise SystemExit(
                 "torch_xla is required for TPU training.\n"
@@ -205,6 +207,7 @@ def main() -> None:
             "Run:  python scripts/download_coco.py --dest " + str(data_root)
         )
 
+    pin_memory = dc.get("pin_memory", True) and device.type not in ("cpu", "xla")
     train_loader = build_dataloader(
         str(data_root / dc["train_img_dir"]),
         str(data_root / dc["train_ann"]),
@@ -212,16 +215,18 @@ def main() -> None:
         batch_size=tc["batch_size"],
         num_workers=dc["num_workers"],
         train=True,
+        pin_memory=pin_memory,
     )
     val_loader = None
     if not args.no_val:
         val_loader = build_dataloader(
             str(data_root / dc["val_img_dir"]),
             str(data_root / dc["val_ann"]),
-            img_size=args.img_size,
+            img_size=cfg["model"]["img_size"],
             batch_size=tc["batch_size"],
             num_workers=dc["num_workers"],
             train=False,
+            pin_memory=pin_memory,
         )
 
     model, criterion = build_model_and_criterion(cfg, device)

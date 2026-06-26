@@ -83,6 +83,7 @@ def build_dataloader(
     batch_size: int = 4,
     num_workers: int = 8,
     train: bool = True,
+    pin_memory: bool = True,
 ) -> DataLoader:
     dataset = CocoDetection(img_dir, ann_file, img_size, train)
     return DataLoader(
@@ -90,7 +91,7 @@ def build_dataloader(
         batch_size=batch_size,
         shuffle=train,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=pin_memory,
         collate_fn=collate_fn,
         drop_last=train,
     )
