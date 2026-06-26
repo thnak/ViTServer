@@ -181,7 +181,8 @@ def main() -> None:
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
 
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    dev_str = "cuda" if args.device.lower() == "gpu" else args.device
+    device = torch.device(dev_str if torch.cuda.is_available() or dev_str == "cpu" else "cpu")
     img_size = cfg["model"]["img_size"]
 
     class_names = COCO_CLASSES
