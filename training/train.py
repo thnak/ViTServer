@@ -189,6 +189,103 @@ class EMA:
             ema_p.mul_(self.decay).add_(p.data, alpha=1 - self.decay)
 
 
+# ── console helpers ──────────────────────────────────────────────────────────
+
+_EW = (11, 11, 11, 11, 11, 11)                                      # col widths
+_EH = ("Epoch", "loss_cls", "loss_l1", "loss_ciou", "total", "lr")  # headers
+_HDREP = 20                                                          # reprint every N epochs
+
+
+def _hline(widths, l="├", m="┼", r="┤") -> str:
+    return l + m.join("─" * w for w in widths) + r
+
+
+def _cells(vals, widths) -> str:
+    return "│" + "│".join(f" {str(v):>{w - 2}} " for v, w in zip(vals, widths)) + "│"
+
+
+def print_run_header(
+    cfg: dict, args: argparse.Namespace, model: nn.Module, device: torch.device
+) -> None:
+    mc, tc = cfg["model"], cfg["training"]
+    n_params = sum(p.numel() for p in model.parameters()) / 1e6
+    compile_str = args.compile_mode if args.compile else "off"
+
+    left = [
+        ("img_size",       str(mc["img_size"])),
+        ("base_channels",  str(mc["base_channels"])),
+        ("embed_dim",      str(mc["embed_dim"])),
+        ("num_heads",      str(mc["num_heads"])),
+        ("num_queries",    str(mc["num_queries"])),
+        ("num_classes",    str(mc["num_classes"])),
+        ("encoder_type",   mc.get("encoder_type", "none")),
+        ("decoder_layers", str(mc["num_decoder_layers"])),
+        ("parameters",     f"{n_params:.2f} M"),
+    ]
+    right = [
+        ("epochs",         str(tc["epochs"])),
+        ("batch_size",     str(tc["batch_size"])),
+        ("eff_batch",      str(tc["batch_size"] * tc["grad_accumulate"])),
+        ("lr",             f"{tc['lr']:.2e}"),
+        ("lr_backbone",    f"{tc['lr_backbone']:.2e}"),
+        ("amp",            str(tc["amp"])),
+        ("ema",            str(tc["ema"])),
+        ("warmup",         f"{tc['warmup_epochs']} ep"),
+        ("compile",        compile_str),
+    ]
+    while len(left) < len(right): left.append(("", ""))
+    while len(right) < len(left): right.append(("", ""))
+
+    KW, VW = 14, 10
+    CW = KW + VW + 6   # "  {key:<14}: {val:>10}  " = 2+14+2+10+2 = 30
+    W  = CW * 2 + 3    # │ left(30) │ right(30) │
+
+    title = " ViTServer — NMS-Free Detector "
+    print("┌" + "─" * (W - 2) + "┐")
+    print("│" + title.center(W - 2) + "│")
+    print("├" + "─" * CW + "┬" + "─" * CW + "┤")
+    print("│" + " Model".ljust(CW) + "│" + " Training".ljust(CW) + "│")
+    print("├" + "─" * CW + "┼" + "─" * CW + "┤")
+    for (lk, lv), (rk, rv) in zip(left, right):
+        lc = f"  {lk:<{KW}}: {lv:>{VW}}  "
+        rc = f"  {rk:<{KW}}: {rv:>{VW}}  "
+        print("│" + lc + "│" + rc + "│")
+    print("└" + "─" * CW + "┴" + "─" * CW + "┘")
+
+
+def print_epoch_header() -> None:
+    print(_hline(_EW, "┌", "┬", "┐"))
+    print(_cells(_EH, _EW))
+    print(_hline(_EW))
+
+
+def print_epoch_row(epoch: int, total: int, metrics: dict, lr: float) -> None:
+    vals = (
+        f"{epoch + 1}/{total}",
+        f"{metrics.get('loss_cls',  0.):.4f}",
+        f"{metrics.get('loss_l1',   0.):.4f}",
+        f"{metrics.get('loss_ciou', 0.):.4f}",
+        f"{metrics.get('total',     0.):.4f}",
+        f"{lr:.2e}",
+    )
+    print(_cells(vals, _EW))
+
+
+def print_val_metrics(epoch: int, total: int, metrics: dict) -> None:
+    pairs = [
+        ("mAP",    metrics.get("mAP",   0.), "mAP@50", metrics.get("mAP50", 0.)),
+        ("mAP@75", metrics.get("mAP75", 0.), "mAP_s",  metrics.get("mAP_s", 0.)),
+        ("mAP_m",  metrics.get("mAP_m", 0.), "mAP_l",  metrics.get("mAP_l", 0.)),
+    ]
+    lines = [f"  {k1:<8} {v1:.4f}    {k2:<8} {v2:.4f}  " for k1, v1, k2, v2 in pairs]
+    inner = max(len(ln) for ln in lines)
+    title = f" Val · Epoch {epoch + 1}/{total} "
+    print("┌─" + title + "─" * (inner - 1 - len(title)) + "┐")
+    for line in lines:
+        print("│" + line + "│")
+    print("└" + "─" * inner + "┘")
+
+
 def main() -> None:
     args = parse_args()
     device, mark_step_fn = _resolve_device(args.device)
@@ -237,6 +334,7 @@ def main() -> None:
         )
 
     model, criterion = build_model_and_criterion(cfg, device)
+    print_run_header(cfg, args, model, device)
 
     if args.compile and device.type == "cuda":
         import platform
@@ -277,7 +375,20 @@ def main() -> None:
         best_map = ckpt.get("best_map", 0.0)
         print(f"Resumed from epoch {start_epoch}")
 
+    n_train = len(train_loader.dataset)
+    n_val   = len(val_loader.dataset) if val_loader else 0
+    print(f"  Dataset    train {n_train:,}  │  val {n_val:,}  │  workers {num_workers}")
+    print(f"  Save dir   {save_dir}")
+    if args.resume:
+        print(f"  Resuming   epoch {start_epoch} → {tc['epochs']}")
+    print()
+    print_epoch_header()
+
     for epoch in range(start_epoch, tc["epochs"]):
+        if epoch != start_epoch and (epoch - start_epoch) % _HDREP == 0:
+            print_epoch_header()
+
+        current_lr = optimizer.param_groups[-1]["lr"]
         train_metrics = train_one_epoch(
             model, criterion, train_loader, optimizer, scaler, device, epoch,
             amp_enabled=amp_enabled,
@@ -290,8 +401,7 @@ def main() -> None:
         if ema:
             ema.update(model)
 
-        loss_str = "  ".join(f"{k}: {v:.4f}" for k, v in train_metrics.items())
-        print(f"Epoch {epoch} | {loss_str}")
+        print_epoch_row(epoch, tc["epochs"], train_metrics, current_lr)
 
         for k, v in train_metrics.items():
             writer.add_scalar(f"train/{k}", v, epoch)
@@ -301,7 +411,7 @@ def main() -> None:
             val_metrics = validate(eval_model, val_loader, device, str(data_root / dc["val_ann"]), amp_enabled=amp_enabled)
             for k, v in val_metrics.items():
                 writer.add_scalar(f"val/{k}", v, epoch)
-            print(f"Epoch {epoch} | {val_metrics}")
+            print_val_metrics(epoch, tc["epochs"], val_metrics)
 
             if val_metrics["mAP"] > best_map:
                 best_map = val_metrics["mAP"]
@@ -324,8 +434,9 @@ def main() -> None:
                 "best_map": best_map,
             }, save_dir / f"epoch_{epoch}.pt")
 
+    print(_hline(_EW, "└", "┴", "┘"))
     writer.close()
-    print(f"Training complete. Best mAP: {best_map:.4f}")
+    print(f"\n  Training complete — best mAP: {best_map:.4f}  │  checkpoints: {save_dir}")
 
 
 if __name__ == "__main__":
