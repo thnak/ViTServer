@@ -37,20 +37,35 @@ ViTServer/
 
 ### Model Variants
 
-All variants trained on COCO 2017 (80 classes) unless noted. GFLOPs measured at the listed input resolution with a batch size of 1.
+All variants target COCO 2017 (80 classes). GFLOPs at batch size 1, split into CNN backbone and transformer attention costs.
 
-| Variant | `base_ch` | `embed_dim` | Params | GFLOPs | Input |
+> **Note — encoder attention dominates:** the transformer encoder runs self-attention on all P3+P4+P5 tokens (8 400 at 640 px, 33 600 at 1 280 px), making attention 10–20× more expensive than the backbone. `thop` has no hook for `nn.MultiheadAttention` so the backbone-only column is what most profilers report; the attention column was computed analytically. A future optimisation (AIFI-style: attend on P5 only) would reduce encoder cost by ~441×.
+
+| Variant | `base_ch` | `embed_dim` | Params | CNN GFLOPs | Attn GFLOPs | **Total GFLOPs** | Input |
+|---|---|---|---|---|---|---|---|
+| **smoke** *(dev only)* | 8 | 32 | 0.2 M | 0.003 | 0.003 | **0.006** | 64×64 |
+| **nano** | 16 | 64 | 0.8 M | 0.70 | 19.0 | **19.7** | 640×640 |
+| **small** | 32 | 128 | 3.6 M | 2.80 | 41.0 | **43.8** | 640×640 |
+| **medium** | 48 | 256 | 12.9 M | 9.01 | 94.6 | **103.6** | 640×640 |
+| **large** | 64 | 256 | 16.5 M | 12.17 | 94.6 | **106.8** | 640×640 |
+| **xlarge** | 96 | 512 | 51.1 M | 35.4 | 201.7 | **237** | 640×640 |
+| **xlarge** | 96 | 512 | 51.1 M | 112.6 | 2 515 | **2 628** | 1280×1280 |
+
+### Deployment Planning
+
+Recommended serving hardware per variant. FPS estimates assume TensorRT FP16, single stream, sustained throughput (not peak burst).
+
+| Variant | Total GFLOPs | Target Platform | Runtime | Priority | Estimated FPS |
 |---|---|---|---|---|---|
-| **smoke** *(dev only)* | 8 | 32 | 0.2 M | 0.003 | 64×64 |
-| **nano** | 16 | 64 | 0.8 M | 0.70 | 640×640 |
-| **small** | 32 | 128 | 3.6 M | 2.80 | 640×640 |
-| **medium** | 48 | 256 | 12.9 M | 9.01 | 640×640 |
-| **large** | 64 | 256 | 16.5 M | 12.17 | 640×640 |
-| **xlarge** | 96 | 512 | 51.1 M | 35.37 | 640×640 |
-| **xlarge** | 96 | 512 | 51.1 M | 112.63 | 1280×1280 |
+| **xlarge @1280** | 2 628 G | ☁️ Cloud — A100 / H100 80 GB | TRT FP16, batch ≥ 4 | Accuracy-first, async / offline | ~10–30 |
+| **xlarge @640** | 237 G | ☁️ Cloud — A100 / RTX 4090 | TRT FP16 | High accuracy, low latency | ~60–120 |
+| **large @640** | 107 G | 🖥️ Server — RTX 3080 / 4080 | TRT FP16 | Balanced | ~60–100 |
+| **medium @640** | 104 G | 🖥️ Server — RTX 3060 / 4070 | TRT FP16 | Production sweet spot | ~50–80 |
+| **small @640** | 43.8 G | 📦 Edge server — Jetson AGX Orin | TRT INT8 | Edge, near-real-time | ~20–40 |
+| **nano @640** | 19.7 G | 📦 Edge — Jetson Orin NX / Xavier | TRT INT8 | Ultra-edge, power-constrained | ~15–30 |
+| **any** | — | 💻 CPU only (dev / test) | ORT FP32 | Development and CI only | <5 |
 
-> GFLOPs = 2 × MACs, counted with [thop](https://github.com/Lyken17/pytorch-OpCounter).  
-> thop undercounts parameters (~25%) for custom attention layers; the Params column uses `sum(p.numel())`.
+> FPS figures are directional estimates; actual throughput depends on batch size, memory bandwidth, driver version, and encoder architecture (see note above). Benchmark with `trtexec --iterations=100` for your specific hardware.
 
 ### Loss Functions
 
