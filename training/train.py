@@ -271,6 +271,8 @@ def main() -> None:
         ckpt = torch.load(args.resume, map_location=device)
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
+        if "scheduler" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler"])
         start_epoch = ckpt["epoch"] + 1
         best_map = ckpt.get("best_map", 0.0)
         print(f"Resumed from epoch {start_epoch}")
@@ -305,10 +307,19 @@ def main() -> None:
                 best_map = val_metrics["mAP"]
                 torch.save({"model": model.state_dict(), "epoch": epoch, "best_map": best_map}, save_dir / "best.pt")
 
+        torch.save({
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "epoch": epoch,
+            "best_map": best_map,
+        }, save_dir / "last.pt")
+
         if (epoch + 1) % lc["save_period"] == 0:
             torch.save({
                 "model": model.state_dict(),
                 "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
                 "epoch": epoch,
                 "best_map": best_map,
             }, save_dir / f"epoch_{epoch}.pt")
