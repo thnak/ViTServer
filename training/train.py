@@ -208,12 +208,14 @@ def main() -> None:
         )
 
     pin_memory = dc.get("pin_memory", True) and device.type not in ("cpu", "xla")
+    # XLA (TPU) forks dataloader workers which deadlock against XLA's internal state.
+    num_workers = 0 if device.type == "xla" else dc["num_workers"]
     train_loader = build_dataloader(
         str(data_root / dc["train_img_dir"]),
         str(data_root / dc["train_ann"]),
         img_size=cfg["model"]["img_size"],
         batch_size=tc["batch_size"],
-        num_workers=dc["num_workers"],
+        num_workers=num_workers,
         train=True,
         pin_memory=pin_memory,
     )
@@ -224,7 +226,7 @@ def main() -> None:
             str(data_root / dc["val_ann"]),
             img_size=cfg["model"]["img_size"],
             batch_size=tc["batch_size"],
-            num_workers=dc["num_workers"],
+            num_workers=num_workers,
             train=False,
             pin_memory=pin_memory,
         )
