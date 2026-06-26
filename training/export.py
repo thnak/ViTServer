@@ -93,6 +93,8 @@ def main() -> None:
         num_queries=mc["num_queries"],
         dropout=0.0,
         aux_loss=False,
+        encoder_type=mc.get("encoder_type", "none"),
+        window_size=mc.get("window_size", 8),
     )
 
     ckpt = torch.load(args.weights, map_location=device)

@@ -52,6 +52,8 @@ def build_model_and_criterion(cfg: dict, device: torch.device):
         num_queries=model_cfg["num_queries"],
         dropout=model_cfg["dropout"],
         aux_loss=model_cfg["aux_loss"],
+        encoder_type=model_cfg.get("encoder_type", "none"),
+        window_size=model_cfg.get("window_size", 8),
     ).to(device)
 
     lc = cfg["loss"]

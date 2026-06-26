@@ -1,7 +1,13 @@
 """Transformer encoder-decoder for NMS-Free detection.
 
-Encoder: Scale-Aware Intra-Scale Attention (AIFI) on the finest feature level
-         followed by cross-scale feature fusion.
+Encoder options (set via NMSFreeDetector encoder_type):
+  "none"   — no encoder; MFE tokens flow directly to decoder (default).
+             Decoder cross-attention handles all inter-scale reasoning.
+  "window" — per-scale windowed self-attention (ws×ws windows, O(N×ws²)).
+             Sees all three scales; no O(N²) full-sequence bottleneck.
+  "full"   — legacy full self-attention on all 8400 tokens (O(N²)).
+             Kept for ablation; not recommended at 640+ px.
+
 Decoder: 6-layer cross-attention decoder with learnable object queries.
 """
 
@@ -122,9 +128,106 @@ class TransformerEncoder(nn.Module):
             TransformerEncoderLayer(d, nhead, ffn_dim) for _ in range(num_layers)
         )
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, shapes=None) -> Tensor:  # shapes unused (full attention)
         for layer in self.layers:
             x = layer(x)
+        return x
+
+
+# ---------------------------------------------------------------------------
+# Window helpers — all contiguous reshape+permute, no gather/scatter
+# ---------------------------------------------------------------------------
+
+def _window_partition(x: Tensor, ws: int) -> Tensor:
+    """[B, H, W, D] → [B*nW, ws*ws, D].  H and W must be multiples of ws."""
+    B, H, W, D = x.shape
+    x = x.view(B, H // ws, ws, W // ws, ws, D)
+    return x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, ws * ws, D)
+
+
+def _window_unpartition(windows: Tensor, ws: int, H: int, W: int, B: int) -> Tensor:
+    """[B*nW, ws*ws, D] → [B, H, W, D]."""
+    D = windows.shape[-1]
+    x = windows.view(B, H // ws, W // ws, ws, ws, D)
+    return x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, D)
+
+
+# ---------------------------------------------------------------------------
+# Window encoder — per-scale windowed self-attention
+# ---------------------------------------------------------------------------
+
+class ScaleWindowEncoderLayer(nn.Module):
+    """One layer of per-scale windowed self-attention.
+
+    Each scale's tokens are windowed independently (ws×ws windows).
+    Scales that are smaller than a single window get full attention.
+    Padding is applied when H or W is not a multiple of ws; unpadded after.
+    """
+
+    def __init__(self, d: int, nhead: int, ffn_dim: int,
+                 window_size: int = 8, dropout: float = 0.0) -> None:
+        super().__init__()
+        self.window_size = window_size
+        self.attn = nn.MultiheadAttention(d, nhead, dropout=dropout, batch_first=True)
+        self.ffn = nn.Sequential(
+            nn.Linear(d, ffn_dim), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(ffn_dim, d), nn.Dropout(dropout),
+        )
+        self.norm1 = nn.LayerNorm(d)
+        self.norm2 = nn.LayerNorm(d)
+
+    def _attn_scale(self, tokens: Tensor, h: int, w: int) -> Tensor:
+        B, N, D = tokens.shape
+        ws = self.window_size
+        if h <= ws and w <= ws:
+            out, _ = self.attn(tokens, tokens, tokens)
+            return out
+        # Pad spatial dims to multiples of ws
+        pad_h = (ws - h % ws) % ws
+        pad_w = (ws - w % ws) % ws
+        x = tokens.view(B, h, w, D)
+        if pad_h or pad_w:
+            x = x.permute(0, 3, 1, 2)                          # [B, D, H, W]
+            x = F.pad(x, (0, pad_w, 0, pad_h))
+            x = x.permute(0, 2, 3, 1)                          # [B, Hp, Wp, D]
+        hp, wp = h + pad_h, w + pad_w
+        windows = _window_partition(x, ws)                      # [B*nW, ws², D]
+        out_w, _ = self.attn(windows, windows, windows)
+        out_x = _window_unpartition(out_w, ws, hp, wp, B)      # [B, Hp, Wp, D]
+        if pad_h or pad_w:
+            out_x = out_x[:, :h, :w, :].contiguous()
+        return out_x.view(B, N, D)
+
+    def forward(self, x: Tensor, shapes: list[tuple[int, int]]) -> Tensor:
+        splits = [h * w for h, w in shapes]
+        per_scale = list(torch.split(x, splits, dim=1))
+        results = []
+        for tokens, (h, w) in zip(per_scale, shapes):
+            tokens = tokens + self._attn_scale(self.norm1(tokens), h, w)
+            tokens = tokens + self.ffn(self.norm2(tokens))
+            results.append(tokens)
+        return torch.cat(results, dim=1)
+
+
+class ScaleWindowEncoder(nn.Module):
+    """Stack of ScaleWindowEncoderLayers.
+
+    Complexity: O(N × ws²) per layer instead of O(N²).
+    At 640 px with ws=8: ~672K ops vs 70M for full attention (104× cheaper).
+    Sees all three feature scales (P3/P4/P5) unlike AIFI which only sees P5.
+    """
+
+    def __init__(self, d: int, nhead: int, num_layers: int,
+                 ffn_dim: int, window_size: int = 8) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList(
+            ScaleWindowEncoderLayer(d, nhead, ffn_dim, window_size)
+            for _ in range(num_layers)
+        )
+
+    def forward(self, x: Tensor, shapes: list[tuple[int, int]]) -> Tensor:
+        for layer in self.layers:
+            x = layer(x, shapes)
         return x
 
 

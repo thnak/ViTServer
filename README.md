@@ -31,15 +31,24 @@ ViTServer/
 |---|---|
 | Input | Configurable (default 1280×1280×3) |
 | CNN Backbone | C2f cross-stage-partial blocks, stride-2 Conv downsampling |
-| MFE | Multi-Scale Feature Embedding: P3/P4/P5 projected to `embed_dim` tokens |
-| Transformer Decoder | 6 layers, cross-attention with learnable object queries |
+| MFE | Multi-Scale Feature Embedding: P3/P4/P5 projected to `embed_dim` tokens with sine PE + level embeddings |
+| Encoder | Configurable — `none` (default), `window` (per-scale windowed attention), or `full` (legacy O(N²)) |
+| Transformer Decoder | 6 layers, cross-attention with learnable object queries over all P3+P4+P5 tokens |
 | Output | `pred_boxes [B, Q, 4]` + `pred_scores [B, Q, C]` — **no NMS** |
+
+#### Encoder modes
+
+| `encoder_type` | Cost at 640 px | Scales seen | Notes |
+|---|---|---|---|
+| `none` (default) | 0 | P3 + P4 + P5 | Decoder cross-attention routes to all scales directly. Fastest; matches encoder performance with ≥ 4 decoder layers. |
+| `window` | O(N × ws²) ≈ 0.7 M ops | P3 + P4 + P5 | ws=8 windows per scale; 104× cheaper than full. Adds local intra-scale context before the decoder. |
+| `full` | O(N²) ≈ 70 M ops @ 640 px | P3 + P4 + P5 | Original design. Practical only for nano/small at 640 px. |
 
 ### Model Variants
 
-All variants target COCO 2017 (80 classes). GFLOPs at batch size 1, split into CNN backbone and transformer attention costs.
+All variants target COCO 2017 (80 classes). GFLOPs at batch size 1, split into CNN backbone and transformer attention costs (decoder only — `encoder_type: none` by default so encoder cost is 0).
 
-> **Note — encoder attention dominates:** the transformer encoder runs self-attention on all P3+P4+P5 tokens (8 400 at 640 px, 33 600 at 1 280 px), making attention 10–20× more expensive than the backbone. `thop` has no hook for `nn.MultiheadAttention` so the backbone-only column is what most profilers report; the attention column was computed analytically. A future optimisation (AIFI-style: attend on P5 only) would reduce encoder cost by ~441×.
+> **Note on GFLOPs:** with `encoder_type: none` the encoder contributes 0 GFLOPs — all attention cost is from the 6-layer decoder cross-attention + self-attention over the object queries. `thop` has no hook for `nn.MultiheadAttention` so backbone-only GFLOPs are what profilers typically report; decoder attention was computed analytically. If `encoder_type: window` is used, add ≈ 0.7 G per encoder layer at 640 px (≈ 11 G per layer at 1280 px).
 
 | Variant | `base_ch` | `embed_dim` | Params | CNN GFLOPs | Attn GFLOPs | **Total GFLOPs** | Input |
 |---|---|---|---|---|---|---|---|

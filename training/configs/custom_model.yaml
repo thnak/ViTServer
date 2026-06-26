@@ -6,7 +6,9 @@ model:
   base_channels: 64          # CNN backbone channel multiplier
   embed_dim: 256             # Transformer embedding dimension
   num_heads: 8
-  num_encoder_layers: 1      # Scale-aware intra-scale encoder layers
+  encoder_type: none         # "none" | "window" | "full"
+  num_encoder_layers: 0      # number of encoder layers (0 = skip encoder entirely)
+  window_size: 8             # window size for encoder_type: window
   num_decoder_layers: 6
   num_queries: 300           # Object query slots
   num_classes: 80            # COCO default; override for custom datasets
