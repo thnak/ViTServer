@@ -35,6 +35,23 @@ ViTServer/
 | Transformer Decoder | 6 layers, cross-attention with learnable object queries |
 | Output | `pred_boxes [B, Q, 4]` + `pred_scores [B, Q, C]` — **no NMS** |
 
+### Model Variants
+
+All variants trained on COCO 2017 (80 classes) unless noted. GFLOPs measured at the listed input resolution with a batch size of 1.
+
+| Variant | `base_ch` | `embed_dim` | Params | GFLOPs | Input |
+|---|---|---|---|---|---|
+| **smoke** *(dev only)* | 8 | 32 | 0.2 M | 0.003 | 64×64 |
+| **nano** | 16 | 64 | 0.8 M | 0.70 | 640×640 |
+| **small** | 32 | 128 | 3.6 M | 2.80 | 640×640 |
+| **medium** | 48 | 256 | 12.9 M | 9.01 | 640×640 |
+| **large** | 64 | 256 | 16.5 M | 12.17 | 640×640 |
+| **xlarge** | 96 | 512 | 51.1 M | 35.37 | 640×640 |
+| **xlarge** | 96 | 512 | 51.1 M | 112.63 | 1280×1280 |
+
+> GFLOPs = 2 × MACs, counted with [thop](https://github.com/Lyken17/pytorch-OpCounter).  
+> thop undercounts parameters (~25%) for custom attention layers; the Params column uses `sum(p.numel())`.
+
 ### Loss Functions
 
 | Loss | Purpose |
