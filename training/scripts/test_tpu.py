@@ -130,16 +130,21 @@ def stage_train_step(dev, xm):
     opt = torch.optim.AdamW(model.parameters(), lr=1e-4)
 
     B = 2
+    MAX_T = 100
     imgs = torch.randn(B, 3, 64, 64, device=dev, dtype=torch.bfloat16)
-    targets = [
-        {
-            "boxes":   torch.tensor([[0.5, 0.5, 0.2, 0.2]], device=dev),
-            "labels":  torch.tensor([0], device=dev),
-            "image_id": torch.tensor(i),
-            "orig_size": torch.tensor([64, 64]),
-        }
-        for i in range(B)
-    ]
+
+    def _make_target(i):
+        labels = torch.zeros(MAX_T, dtype=torch.long)
+        boxes  = torch.zeros(MAX_T, 4)
+        valid  = torch.zeros(MAX_T, dtype=torch.bool)
+        boxes[0] = torch.tensor([0.5, 0.5, 0.2, 0.2])
+        valid[0] = True
+        return {k: v.to(dev) for k, v in {
+            "labels": labels, "boxes": boxes, "valid": valid,
+            "image_id": torch.tensor(i), "orig_size": torch.tensor([64, 64]),
+        }.items()}
+
+    targets = [_make_target(i) for i in range(B)]
 
     def step():
         import torch_xla

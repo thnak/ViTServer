@@ -71,9 +71,31 @@ class CocoDetection(Dataset):
         return image, target
 
 
+MAX_TARGETS = 100  # COCO max ≈ 93; must match _MAX_T in losses/hungarian.py
+
+
 def collate_fn(batch: list) -> tuple[Tensor, list[dict]]:
-    images, targets = zip(*batch)
-    return torch.stack(images), list(targets)
+    images = []
+    targets = []
+    for img, t in batch:
+        images.append(img)
+        M = len(t["labels"])
+        n = min(M, MAX_TARGETS)
+        labels = torch.zeros(MAX_TARGETS, dtype=torch.long)
+        boxes  = torch.zeros(MAX_TARGETS, 4)
+        valid  = torch.zeros(MAX_TARGETS, dtype=torch.bool)
+        if n > 0:
+            labels[:n] = t["labels"][:n]
+            boxes[:n]  = t["boxes"][:n]
+            valid[:n]  = True
+        targets.append({
+            "image_id":  t["image_id"],
+            "orig_size": t["orig_size"],
+            "labels": labels,
+            "boxes":  boxes,
+            "valid":  valid,
+        })
+    return torch.stack(images), targets
 
 
 def build_dataloader(

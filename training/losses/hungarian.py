@@ -10,9 +10,16 @@ from scipy.optimize import linear_sum_assignment
 from .bbox_loss import ciou_loss, l1_loss, box_cxcywh_to_xyxy, box_iou
 from .focal_loss import sigmoid_focal_loss
 
+# Must match MAX_TARGETS in datasets/coco_dataset.py
+_MAX_T = 100
+
 
 class HungarianMatcher(nn.Module):
-    """Compute optimal bipartite matching between predictions and targets."""
+    """Compute optimal bipartite matching between predictions and padded targets.
+
+    Returns fixed-size (pi, ti, valid) tuples — [_MAX_T] CPU tensors — so the
+    downstream criterion only ever sees constant-shape index tensors on device.
+    """
 
     def __init__(
         self,
@@ -21,7 +28,7 @@ class HungarianMatcher(nn.Module):
         giou_weight: float = 2.0,
     ) -> None:
         super().__init__()
-        self.cls_w = cls_weight
+        self.cls_w  = cls_weight
         self.bbox_w = bbox_weight
         self.giou_w = giou_weight
 
@@ -29,141 +36,164 @@ class HungarianMatcher(nn.Module):
     def forward(
         self,
         pred_logits: Tensor,   # [B, Q, C]
-        pred_boxes: Tensor,    # [B, Q, 4]
-        targets: list[dict],   # list of {"labels": [M], "boxes": [M, 4]}
-    ) -> list[tuple[Tensor, Tensor]]:
-        # Pull predictions off device once — keeps the entire cost computation on CPU
-        # so XLA sees a single host-callback boundary instead of many mid-graph syncs.
-        # float32 is required; bfloat16 has insufficient precision for the cost matrix.
+        pred_boxes:  Tensor,   # [B, Q, 4]
+        targets: list[dict],   # padded: labels/boxes [MAX_T], valid [MAX_T]
+    ) -> list[tuple[Tensor, Tensor, Tensor]]:
+        # Entire cost computation on CPU — single host boundary, no mid-graph syncs.
         pred_logits = pred_logits.detach().float().cpu()
-        pred_boxes = pred_boxes.detach().float().cpu()
-
+        pred_boxes  = pred_boxes.detach().float().cpu()
         B, Q, C = pred_logits.shape
         indices = []
 
         for b in range(B):
-            tgt = targets[b]
-            tgt_cls = tgt["labels"].cpu()    # [M]
-            tgt_boxes = tgt["boxes"].cpu()   # [M, 4]
+            pi_pad = torch.zeros(_MAX_T, dtype=torch.long)
+            ti_pad = torch.zeros(_MAX_T, dtype=torch.long)
+            v_pad  = torch.zeros(_MAX_T, dtype=torch.bool)
+
+            valid_cpu = targets[b]["valid"].cpu()              # [MAX_T]
+            tgt_cls   = targets[b]["labels"].cpu()[valid_cpu]  # [M]
+            tgt_boxes = targets[b]["boxes"].cpu()[valid_cpu]   # [M, 4]
             M = len(tgt_cls)
-            if M == 0:
-                indices.append((torch.zeros(0, dtype=torch.long), torch.zeros(0, dtype=torch.long)))
-                continue
 
-            # Classification cost: focal-style, [Q, M]
-            p = pred_logits[b].sigmoid()    # [Q, C]
-            cls_cost = -p[:, tgt_cls]       # [Q, M]
+            if M > 0:
+                p        = pred_logits[b].sigmoid()
+                cls_cost = -p[:, tgt_cls]
+                l1_cost  = torch.cdist(pred_boxes[b], tgt_boxes, p=1)
 
-            # L1 box cost: [Q, M]
-            l1_cost = torch.cdist(pred_boxes[b], tgt_boxes, p=1)
+                p_xyxy = box_cxcywh_to_xyxy(
+                    pred_boxes[b].unsqueeze(1).expand(-1, M, -1).reshape(-1, 4))
+                t_xyxy = box_cxcywh_to_xyxy(
+                    tgt_boxes.unsqueeze(0).expand(Q, -1, -1).reshape(-1, 4))
+                iou, union = box_iou(p_xyxy, t_xyxy)
+                enc_area = (
+                    (torch.max(p_xyxy[:, 2:], t_xyxy[:, 2:])
+                     - torch.min(p_xyxy[:, :2], t_xyxy[:, :2]))
+                    .clamp(0).prod(dim=1)
+                )
+                giou      = iou - (enc_area - union) / enc_area.clamp(1e-6)
+                giou_cost = -giou.reshape(Q, M)
 
-            # GIoU cost: [Q, M]
-            p_xyxy = box_cxcywh_to_xyxy(pred_boxes[b].unsqueeze(1).expand(-1, M, -1).reshape(-1, 4))
-            t_xyxy = box_cxcywh_to_xyxy(tgt_boxes.unsqueeze(0).expand(Q, -1, -1).reshape(-1, 4))
-            iou, union = box_iou(p_xyxy, t_xyxy)
-            enc_area = (
-                (torch.max(p_xyxy[:, 2:], t_xyxy[:, 2:]) - torch.min(p_xyxy[:, :2], t_xyxy[:, :2]))
-                .clamp(0).prod(dim=1)
-            )
-            giou = iou - (enc_area - union) / enc_area.clamp(1e-6)
-            giou_cost = -giou.reshape(Q, M)
+                cost     = self.cls_w * cls_cost + self.bbox_w * l1_cost + self.giou_w * giou_cost
+                row, col = linear_sum_assignment(cost.numpy())
+                k = len(row)
+                pi_pad[:k] = torch.as_tensor(row, dtype=torch.long)
+                ti_pad[:k] = torch.as_tensor(col, dtype=torch.long)
+                v_pad[:k]  = True
 
-            cost = self.cls_w * cls_cost + self.bbox_w * l1_cost + self.giou_w * giou_cost
-            row, col = linear_sum_assignment(cost.numpy())
-            indices.append((
-                torch.as_tensor(row, dtype=torch.long),
-                torch.as_tensor(col, dtype=torch.long),
-            ))
+            indices.append((pi_pad, ti_pad, v_pad))
 
         return indices
 
 
 class HungarianCriterion(nn.Module):
-    """Full loss with Hungarian matching + CIoU + Focal."""
+    """Full loss with Hungarian matching + CIoU + Focal.
+
+    Targets are expected to be pre-padded to MAX_TARGETS by the dataloader's
+    collate_fn.  All loss ops use fixed-shape [MAX_T] index tensors so XLA
+    compiles the graph exactly once, regardless of how many GT boxes each
+    image contains.
+    """
 
     def __init__(
         self,
         num_classes: int,
         matcher: HungarianMatcher,
-        cls_weight: float = 2.0,
-        bbox_weight: float = 5.0,
-        giou_weight: float = 2.0,
-        focal_alpha: float = 0.25,
-        focal_gamma: float = 2.0,
+        cls_weight:   float = 2.0,
+        bbox_weight:  float = 5.0,
+        giou_weight:  float = 2.0,
+        focal_alpha:  float = 0.25,
+        focal_gamma:  float = 2.0,
     ) -> None:
         super().__init__()
         self.num_classes = num_classes
-        self.matcher = matcher
-        self.cls_w = cls_weight
-        self.bbox_w = bbox_weight
-        self.giou_w = giou_weight
+        self.matcher     = matcher
+        self.cls_w       = cls_weight
+        self.bbox_w      = bbox_weight
+        self.giou_w      = giou_weight
         self.focal_alpha = focal_alpha
         self.focal_gamma = focal_gamma
 
+    # ── internal helpers ────────────────────────────────────────────────────
+
     def _loss_labels(
         self,
-        logits: Tensor,
+        logits:  Tensor,
         targets: list[dict],
-        indices: list[tuple[Tensor, Tensor]],
+        indices: list[tuple[Tensor, Tensor, Tensor]],
     ) -> Tensor:
         B, Q, C = logits.shape
-        # Build on CPU as a fixed [B, Q, C] tensor, then transfer once.
-        # Avoids variable-length scatter directly into an XLA tensor which
-        # changes shape every step and forces XLA to recompile the graph.
-        tgt_cls = torch.zeros(B, Q, C)
-        for b, (pi, ti) in enumerate(indices):
-            if len(pi):
-                tgt_cls[b, pi, targets[b]["labels"].cpu()[ti]] = 1.0
-        return sigmoid_focal_loss(logits, tgt_cls.to(logits.device), self.focal_alpha, self.focal_gamma)
+        dev     = logits.device
+        tgt_cls = logits.new_zeros(B, Q, C)  # [B, Q, C] on device — always same shape
+
+        for b, (pi, ti, valid) in enumerate(indices):
+            pi_d    = pi.to(dev)                         # [MAX_T]
+            ti_d    = ti.to(dev)                         # [MAX_T]
+            valid_f = valid.to(dev).to(logits.dtype)     # [MAX_T]
+
+            labs     = targets[b]["labels"][ti_d]        # [MAX_T] — fixed-shape gather
+            flat_idx = pi_d * C + labs                   # [MAX_T] — flat (query, class) index
+            tgt_cls[b].view(-1).scatter_add_(0, flat_idx, valid_f)
+
+        return sigmoid_focal_loss(logits, tgt_cls, self.focal_alpha, self.focal_gamma)
 
     def _loss_boxes(
         self,
         pred_boxes: Tensor,
-        targets: list[dict],
-        indices: list[tuple[Tensor, Tensor]],
+        targets:    list[dict],
+        indices:    list[tuple[Tensor, Tensor, Tensor]],
     ) -> tuple[Tensor, Tensor]:
-        B, Q, _ = pred_boxes.shape
-        # Fixed-shape [B*Q, 4] target tensor + boolean mask — same shape every step.
-        tgt = torch.zeros(B * Q, 4)
-        mask = torch.zeros(B * Q)
-        for b, (pi, ti) in enumerate(indices):
-            if len(pi):
-                flat = b * Q + pi
-                tgt[flat] = targets[b]["boxes"].cpu()[ti]
-                mask[flat] = 1.0
-        dev = pred_boxes.device
-        tgt = tgt.to(dev)
-        mask = mask.to(dev)
-        p = pred_boxes.reshape(-1, 4)
-        return (l1_loss(p, tgt) * mask).sum(), (ciou_loss(p, tgt) * mask).sum()
+        dev        = pred_boxes.device
+        total_l1   = pred_boxes.new_tensor(0.0)
+        total_ciou = pred_boxes.new_tensor(0.0)
 
-    def forward(
+        for b, (pi, ti, valid) in enumerate(indices):
+            pi_d    = pi.to(dev)                     # [MAX_T]
+            ti_d    = ti.to(dev)                     # [MAX_T]
+            valid_f = valid.float().to(dev)          # [MAX_T]
+
+            p = pred_boxes[b, pi_d]                  # [MAX_T, 4] — fixed-shape gather
+            t = targets[b]["boxes"][ti_d]            # [MAX_T, 4] — fixed-shape gather
+            total_l1   = total_l1   + (l1_loss(p, t)   * valid_f).sum()
+            total_ciou = total_ciou + (ciou_loss(p, t) * valid_f).sum()
+
+        return total_l1, total_ciou
+
+    def _compute(
         self,
-        outputs: dict,
-        targets: list[dict],
+        pred_logits: Tensor,
+        pred_boxes:  Tensor,
+        targets:     list[dict],
+        indices:     list[tuple[Tensor, Tensor, Tensor]],
+        num_boxes:   int,
+        prefix:      str = "",
     ) -> dict[str, Tensor]:
-        indices = self.matcher(outputs["pred_logits"], outputs["pred_boxes"], targets)
-        # Use CPU indices (already on CPU from matcher) — avoids len() on XLA tensors
-        num_boxes = max(1, sum(len(pi) for pi, _ in indices))
-
-        l1, ciou = self._loss_boxes(outputs["pred_boxes"], targets, indices)
-        cls = self._loss_labels(outputs["pred_logits"], targets, indices)
-
-        losses: dict[str, Tensor] = {
-            "loss_cls": cls / num_boxes * self.cls_w,
-            "loss_l1": l1 / num_boxes * self.bbox_w,
-            "loss_ciou": ciou / num_boxes * self.giou_w,
+        l1, ciou = self._loss_boxes(pred_boxes, targets, indices)
+        cls      = self._loss_labels(pred_logits, targets, indices)
+        p = f"{prefix}_" if prefix else ""
+        return {
+            f"{p}loss_cls":  cls  / num_boxes * self.cls_w,
+            f"{p}loss_l1":   l1   / num_boxes * self.bbox_w,
+            f"{p}loss_ciou": ciou / num_boxes * self.giou_w,
         }
+
+    # ── public ──────────────────────────────────────────────────────────────
+
+    def forward(self, outputs: dict, targets: list[dict]) -> dict[str, Tensor]:
+        indices   = self.matcher(outputs["pred_logits"], outputs["pred_boxes"], targets)
+        num_boxes = max(1, sum(int(v.sum()) for _, _, v in indices))
+
+        losses = self._compute(
+            outputs["pred_logits"], outputs["pred_boxes"], targets, indices, num_boxes
+        )
 
         if "aux_outputs" in outputs:
             for i, aux in enumerate(outputs["aux_outputs"]):
-                idx = self.matcher(aux["pred_logits"], aux["pred_boxes"], targets)
-                aux_boxes = max(1, sum(len(pi) for pi, _ in idx))
-                l1a, cioua = self._loss_boxes(aux["pred_boxes"], targets, idx)
-                clsa = self._loss_labels(aux["pred_logits"], targets, idx)
-                losses[f"aux_{i}_loss_cls"] = clsa / aux_boxes * self.cls_w
-                losses[f"aux_{i}_loss_l1"] = l1a / aux_boxes * self.bbox_w
-                losses[f"aux_{i}_loss_ciou"] = cioua / aux_boxes * self.giou_w
+                idx   = self.matcher(aux["pred_logits"], aux["pred_boxes"], targets)
+                aux_n = max(1, sum(int(v.sum()) for _, _, v in idx))
+                losses.update(self._compute(
+                    aux["pred_logits"], aux["pred_boxes"],
+                    targets, idx, aux_n, prefix=f"aux_{i}",
+                ))
 
         losses["total"] = sum(losses.values())
         return losses
