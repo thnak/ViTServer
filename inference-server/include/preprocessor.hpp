@@ -1,19 +1,14 @@
 #pragma once
 
-#include <cuda_runtime.h>
+#include <cstdint>
 
 namespace vit {
 
-/// Letterbox-resize a BGR uint8 source image on the GPU to a float32 NCHW
-/// normalised tensor. ImageNet normalisation is applied inside the kernel.
-void cuda_preprocess(
-    const uint8_t* d_src_bgr,   // [src_h × src_w × 3] BGR uint8  (device)
-    int            src_h,
-    int            src_w,
-    float*         d_dst_nchw,  // [3 × dst_h × dst_w] float32    (device)
-    int            dst_h,
-    int            dst_w,
-    cudaStream_t   stream
+/// CPU letterbox resize + BGR→RGB + ImageNet normalise → NCHW float32.
+/// dst_nchw must be pre-allocated: 3 * dst_h * dst_w floats.
+void cpu_preprocess(
+    const uint8_t* src_bgr, int src_h, int src_w,
+    float*         dst_nchw, int dst_h, int dst_w
 );
 
 } // namespace vit

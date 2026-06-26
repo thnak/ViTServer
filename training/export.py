@@ -12,6 +12,7 @@ import onnxruntime as ort
 import yaml
 
 from models import NMSFreeDetector
+from models.transformer import MultiheadAttentionONNX
 
 
 def parse_args() -> argparse.Namespace:
@@ -24,6 +25,35 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--opset", type=int, default=17)
     p.add_argument("--output", default="", help="Output path (default: weights stem + .onnx)")
     return p.parse_args()
+
+
+def _replace_mha_for_onnx(model: torch.nn.Module) -> torch.nn.Module:
+    """Swap nn.MultiheadAttention → MultiheadAttentionONNX and migrate weights.
+
+    PyTorch 2.9+ fuses MHA into aten::_native_multi_head_attention which has
+    no ONNX symbolic.  We replace each MHA with our bmm-based implementation
+    and copy the fused in_proj_weight (Q||K||V stacked) into separate Linear
+    layers so no retraining is needed.
+    """
+    for name, child in list(model.named_children()):
+        if isinstance(child, torch.nn.MultiheadAttention):
+            D = child.embed_dim
+            onnx_attn = MultiheadAttentionONNX(D, child.num_heads, child.dropout)
+            w = child.in_proj_weight.data
+            onnx_attn.q_proj.weight.data.copy_(w[:D])
+            onnx_attn.k_proj.weight.data.copy_(w[D : 2 * D])
+            onnx_attn.v_proj.weight.data.copy_(w[2 * D :])
+            if child.in_proj_bias is not None:
+                b = child.in_proj_bias.data
+                onnx_attn.q_proj.bias.data.copy_(b[:D])
+                onnx_attn.k_proj.bias.data.copy_(b[D : 2 * D])
+                onnx_attn.v_proj.bias.data.copy_(b[2 * D :])
+            onnx_attn.out_proj.weight.data.copy_(child.out_proj.weight.data)
+            onnx_attn.out_proj.bias.data.copy_(child.out_proj.bias.data)
+            setattr(model, name, onnx_attn)
+        else:
+            _replace_mha_for_onnx(child)
+    return model
 
 
 class ExportWrapper(torch.nn.Module):
@@ -66,7 +96,10 @@ def main() -> None:
     model.load_state_dict(state)
     model.eval()
 
+    _replace_mha_for_onnx(model)   # swap fused MHA → bmm-based (ONNX opset 17 compatible)
+
     wrapper = ExportWrapper(model)
+    wrapper.eval()
     dummy = torch.zeros(1, 3, args.img_size, args.img_size)
 
     out_path = args.output or str(Path(args.weights).with_suffix(".onnx"))
@@ -80,16 +113,18 @@ def main() -> None:
         }
 
     print(f"Exporting to {out_path} ...")
-    torch.onnx.export(
-        wrapper,
-        dummy,
-        out_path,
-        opset_version=args.opset,
-        input_names=["images"],
-        output_names=["pred_boxes", "pred_scores"],
-        dynamic_axes=dynamic_axes,
-        do_constant_folding=True,
-    )
+    with torch.no_grad():
+        torch.onnx.export(
+            wrapper,
+            dummy,
+            out_path,
+            opset_version=args.opset,
+            input_names=["images"],
+            output_names=["pred_boxes", "pred_scores"],
+            dynamic_axes=dynamic_axes,
+            do_constant_folding=True,
+            dynamo=False,          # use TorchScript path; torch.export fails on 1×1 spatial dims
+        )
 
     # Verify
     model_onnx = onnx.load(out_path)

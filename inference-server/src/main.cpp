@@ -1,15 +1,15 @@
-/// ViTServer Inference Server — entry point.
-/// Supports: RTSP stream push (WebSocket binary) + single-image REST (HTTP POST).
+/// ViTServer Inference Server
+/// Supports RTSP streams (WebSocket binary push) and single-image REST (POST /infer).
 
-#include <iostream>
-#include <string>
-#include <vector>
 #include <chrono>
-#include <memory>
-#include <thread>
-#include <mutex>
 #include <fstream>
+#include <iostream>
+#include <memory>
+#include <mutex>
 #include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 #include <boost/asio.hpp>
@@ -17,37 +17,37 @@
 #include <boost/beast/websocket.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
-#include <cuda_runtime.h>
 
 #include "engine.hpp"
 #include "preprocessor.hpp"
 #include "postprocessor.hpp"
-#include "rtsp_source.hpp"
 #include "binary_protocol.hpp"
+#ifdef VIT_USE_RTSP
+#include "rtsp_source.hpp"
+#endif
 
 namespace asio  = boost::asio;
 namespace beast = boost::beast;
 namespace http  = beast::http;
 namespace ws    = beast::websocket;
-using tcp       = asio::ip::tcp;
-using json      = nlohmann::json;
+using tcp  = asio::ip::tcp;
+using json = nlohmann::json;
 
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
 struct Config {
     std::string engine_path;
-    int         port{8080};
-    float       score_thresh{0.3f};
-    int         img_size{1280};
+    int   port{8080};
+    float score_thresh{0.3f};
+    int   img_size{1280};
     std::vector<std::string> rtsp_urls;
 };
 
 Config load_config(const std::string& path, const std::string& engine, int port) {
     Config cfg;
-    cfg.engine_path  = engine;
-    cfg.port         = port;
-
+    cfg.engine_path = engine;
+    cfg.port        = port;
     std::ifstream f(path);
     if (f.good()) {
         json j = json::parse(f);
@@ -60,40 +60,40 @@ Config load_config(const std::string& path, const std::string& engine, int port)
 }
 
 // ---------------------------------------------------------------------------
-// Shared inference state
+// Shared inference state (engine + pre-allocated NCHW buffer)
 // ---------------------------------------------------------------------------
 struct InferState {
-    std::unique_ptr<vit::TRTEngine> engine;
-    std::mutex                      mu;
-    float*                          d_input{nullptr};
-    int                             img_size;
-    float                           score_thresh;
+    std::unique_ptr<vit::IEngine> engine;
+    std::mutex mu;
+    float score_thresh;
+    int   img_size;
+    std::vector<float> nchw_buf;   // 3 * img_size * img_size, reused per frame
 
-    explicit InferState(const Config& cfg) : img_size(cfg.img_size), score_thresh(cfg.score_thresh) {
-        engine = std::make_unique<vit::TRTEngine>(cfg.engine_path);
-        cudaMalloc(&d_input, 3LL * img_size * img_size * sizeof(float));
+    explicit InferState(const Config& cfg)
+        : score_thresh(cfg.score_thresh)
+        , img_size(0)    // filled after engine is loaded
+    {
+        engine = vit::IEngine::create(cfg.engine_path);
+        // Use model's static input dimensions; fall back to cfg.img_size if dynamic (< 1)
+        img_size = engine->inputH() > 0 ? engine->inputH() : cfg.img_size;
+        if (engine->inputW() > 0 && engine->inputW() != img_size)
+            std::cerr << "[Engine] Warning: non-square input (" << engine->inputW() << " x " << img_size << ")\n";
+        nchw_buf.resize(3LL * img_size * img_size);
+        std::cout << "[Engine] Loaded: " << cfg.engine_path
+                  << "  input=" << img_size << "x" << img_size << '\n';
     }
-    ~InferState() { cudaFree(d_input); }
 };
 
 // ---------------------------------------------------------------------------
 // Per-frame inference helper
 // ---------------------------------------------------------------------------
-vit::FrameResult run_frame(InferState& state, const uint8_t* bgr_data, int w, int h) {
-    std::lock_guard<std::mutex> lock(state.mu);
+vit::FrameResult run_frame(InferState& state, const uint8_t* bgr, int w, int h) {
+    std::lock_guard<std::mutex> lk(state.mu);
 
-    // Upload BGR to device
-    uint8_t* d_src{nullptr};
-    const size_t nbytes = static_cast<size_t>(h) * w * 3;
-    cudaMalloc(&d_src, nbytes);
-    cudaMemcpy(d_src, bgr_data, nbytes, cudaMemcpyHostToDevice);
+    vit::cpu_preprocess(bgr, h, w, state.nchw_buf.data(), state.img_size, state.img_size);
+    auto dets = state.engine->infer(state.nchw_buf.data(), state.img_size, state.img_size, state.score_thresh);
 
-    vit::cuda_preprocess(d_src, h, w, state.d_input, state.img_size, state.img_size, nullptr);
-    cudaFree(d_src);
-
-    auto dets = state.engine->infer(state.d_input, state.img_size, state.img_size, state.score_thresh);
-
-    uint64_t ts = static_cast<uint64_t>(
+    const uint64_t ts = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()
         ).count()
@@ -115,19 +115,19 @@ vit::FrameResult run_frame(InferState& state, const uint8_t* bgr_data, int w, in
 }
 
 // ---------------------------------------------------------------------------
-// HTTP session — handles /infer (POST multipart or raw PNG/JPEG body)
+// HTTP handler — /infer (POST) and /health (GET)
 // ---------------------------------------------------------------------------
-void handle_http(tcp::socket socket, InferState& state) {
-    beast::flat_buffer buf;
-    http::request<http::dynamic_body> req;
-    http::read(socket, buf, req);
-
+void handle_http(
+    tcp::socket socket,
+    http::request<http::dynamic_body> req,
+    InferState& state)
+{
     http::response<http::string_body> res{http::status::ok, req.version()};
     res.set(http::field::content_type, "application/json");
 
     if (req.method() == http::verb::post && req.target() == "/infer") {
-        auto body_data = beast::buffers_to_string(req.body().data());
-        std::vector<uint8_t> img_bytes(body_data.begin(), body_data.end());
+        auto body_str = beast::buffers_to_string(req.body().data());
+        std::vector<uint8_t> img_bytes(body_str.begin(), body_str.end());
         cv::Mat img = cv::imdecode(img_bytes, cv::IMREAD_COLOR);
         if (img.empty()) {
             res.result(http::status::bad_request);
@@ -159,11 +159,16 @@ void handle_http(tcp::socket socket, InferState& state) {
 }
 
 // ---------------------------------------------------------------------------
-// WebSocket session — receives RTSP frame pushes, sends binary detections
+// WebSocket handler — receives raw BGR frames, sends binary detection payload
+// Frame format: [width uint32][height uint32][BGR bytes]
 // ---------------------------------------------------------------------------
-void handle_ws(tcp::socket raw_socket, InferState& state) {
+void handle_ws(
+    tcp::socket raw_socket,
+    http::request<http::dynamic_body> upgrade_req,
+    InferState& state)
+{
     ws::stream<tcp::socket> wss(std::move(raw_socket));
-    wss.accept();
+    wss.accept(upgrade_req);   // replay the pre-read upgrade request
     wss.binary(true);
 
     beast::flat_buffer buf;
@@ -172,18 +177,17 @@ void handle_ws(tcp::socket raw_socket, InferState& state) {
         wss.read(buf, ec);
         if (ec) break;
 
-        // Interpret incoming bytes as raw BGR frame: first 8 bytes = [width(4)][height(4)]
-        const auto& data = buf.data();
-        if (beast::buffer_bytes(data) < 8) { buf.consume(buf.size()); continue; }
-        const uint8_t* p = static_cast<const uint8_t*>(data.begin()->data());
+        const auto bytes_ready = buf.size();
+        if (bytes_ready < 8) { buf.consume(buf.size()); continue; }
+
+        const uint8_t* p = static_cast<const uint8_t*>(buf.data().data());
         int w, h;
         std::memcpy(&w, p,     4);
         std::memcpy(&h, p + 4, 4);
         const uint8_t* bgr = p + 8;
 
-        auto result = run_frame(state, bgr, w, h);
+        auto result  = run_frame(state, bgr, w, h);
         auto payload = vit::serialise(result);
-
         wss.write(asio::buffer(payload), ec);
         if (ec) break;
         buf.consume(buf.size());
@@ -199,55 +203,54 @@ int main(int argc, char** argv) {
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
-        if (a == "--engine" && i + 1 < argc) engine_path = argv[++i];
-        else if (a == "--port"   && i + 1 < argc) port   = std::stoi(argv[++i]);
-        else if (a == "--config" && i + 1 < argc) config_path = argv[++i];
+        if      (a == "--engine" && i + 1 < argc) engine_path   = argv[++i];
+        else if (a == "--port"   && i + 1 < argc) port          = std::stoi(argv[++i]);
+        else if (a == "--config" && i + 1 < argc) config_path   = argv[++i];
     }
-    if (engine_path.empty()) { std::cerr << "Usage: --engine <model.trt>\n"; return 1; }
+    if (engine_path.empty()) {
+        std::cerr << "Usage: InferenceServer --engine <model.onnx|model.trt> [--port N] [--config path]\n";
+        return 1;
+    }
 
     auto cfg   = load_config(config_path, engine_path, port);
     auto state = std::make_shared<InferState>(cfg);
 
+#ifdef VIT_USE_RTSP
     // Launch RTSP sources
     std::vector<std::unique_ptr<vit::RtspSource>> sources;
     for (const auto& url : cfg.rtsp_urls) {
-        auto src = std::make_unique<vit::RtspSource>(url, [&state, url](const std::vector<uint8_t>& data, int w, int h) {
-            run_frame(*state, data.data(), w, h);
-            // Results would be pushed to subscribed WebSocket clients here
-        });
+        auto src = std::make_unique<vit::RtspSource>(
+            url, [&state](const std::vector<uint8_t>& data, int w, int h) {
+                run_frame(*state, data.data(), w, h);
+            }
+        );
         src->start();
         sources.push_back(std::move(src));
         std::cout << "[RTSP] Started: " << url << '\n';
     }
+#endif
 
     // TCP acceptor
     asio::io_context ioc;
     tcp::acceptor acceptor(ioc, {tcp::v4(), static_cast<unsigned short>(port)});
-    std::cout << "[Server] Listening on port " << port << '\n';
+    std::cout << "[Server] Listening on :" << port << '\n';
 
     while (true) {
         tcp::socket socket(ioc);
         acceptor.accept(socket);
 
-        // Peek first bytes to distinguish WS upgrade from plain HTTP
         std::thread([s = std::move(socket), &state]() mutable {
             try {
-                beast::flat_buffer peek_buf;
-                // Read enough to inspect request
-                http::request_parser<http::empty_body> parser;
+                beast::flat_buffer buf;
+                http::request<http::dynamic_body> req;
                 beast::error_code ec;
-                http::read_header(s, peek_buf, parser, ec);
+                http::read(s, buf, req, ec);
                 if (ec) return;
 
-                if (ws::is_upgrade(parser.get())) {
-                    // Re-establish WS stream from the already-read data
-                    handle_ws(std::move(s), *state);
-                } else {
-                    // Plain HTTP — reconstruct full request
-                    http::request<http::dynamic_body> req = parser.release();
-                    http::read(s, peek_buf, req, ec);
-                    handle_http(std::move(s), *state);
-                }
+                if (ws::is_upgrade(req))
+                    handle_ws(std::move(s), std::move(req), *state);
+                else
+                    handle_http(std::move(s), std::move(req), *state);
             } catch (const std::exception& e) {
                 std::cerr << "[conn] " << e.what() << '\n';
             }

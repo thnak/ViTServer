@@ -47,15 +47,14 @@ class ScaleProjection(nn.Module):
 
     def __init__(self, in_channels: int, embed_dim: int) -> None:
         super().__init__()
-        self.proj = nn.Sequential(
-            nn.Conv2d(in_channels, embed_dim, 1, bias=False),
-            nn.GroupNorm(32, embed_dim),
-        )
+        self.conv = nn.Conv2d(in_channels, embed_dim, 1, bias=False)
+        self.norm = nn.LayerNorm(embed_dim)  # applied on token dim, works at any spatial size
 
     def forward(self, x: Tensor) -> Tensor:
-        x = self.proj(x)                    # [B, D, H, W]
+        x = self.conv(x)                        # [B, D, H, W]
         b, d, h, w = x.shape
-        return x.flatten(2).transpose(1, 2), h, w  # [B, H*W, D], H, W
+        x = x.flatten(2).transpose(1, 2)        # [B, H*W, D]
+        return self.norm(x), h, w
 
 
 class MFE(nn.Module):

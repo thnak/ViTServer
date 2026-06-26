@@ -22,6 +22,7 @@ training/wandb/
 inference-server/build/
 inference-server/*.trt
 inference-server/*.engine
+inference-server/third_party/
 *.o
 *.a
 

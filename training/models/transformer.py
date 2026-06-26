@@ -19,6 +19,49 @@ from torch import Tensor
 # Building blocks
 # ---------------------------------------------------------------------------
 
+class MultiheadAttentionONNX(nn.Module):
+    """Drop-in for nn.MultiheadAttention that exports cleanly to ONNX opset ≥ 17.
+
+    PyTorch 2.9+ fuses MHA into aten::_native_multi_head_attention which has no
+    ONNX symbolic.  This module decomposes to torch.bmm + F.softmax — both have
+    been ONNX ops since opset 1.
+
+    Interface matches nn.MultiheadAttention(batch_first=True):
+        forward(q, k, v) → (output, None)
+    """
+
+    def __init__(self, embed_dim: int, num_heads: int, dropout: float = 0.0) -> None:
+        super().__init__()
+        assert embed_dim % num_heads == 0
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim  = embed_dim // num_heads
+        self.scale     = self.head_dim ** -0.5
+        self.dropout   = dropout
+        self.q_proj  = nn.Linear(embed_dim, embed_dim)
+        self.k_proj  = nn.Linear(embed_dim, embed_dim)
+        self.v_proj  = nn.Linear(embed_dim, embed_dim)
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+
+    def forward(self, q: Tensor, k: Tensor, v: Tensor) -> tuple[Tensor, None]:
+        B, Sq, D = q.shape
+        Sk = k.shape[1]
+        H, dh = self.num_heads, self.head_dim
+
+        q = self.q_proj(q).view(B, Sq, H, dh).permute(0, 2, 1, 3).reshape(B * H, Sq, dh)
+        k = self.k_proj(k).view(B, Sk, H, dh).permute(0, 2, 1, 3).reshape(B * H, Sk, dh)
+        v = self.v_proj(v).view(B, Sk, H, dh).permute(0, 2, 1, 3).reshape(B * H, Sk, dh)
+
+        attn = torch.bmm(q, k.transpose(1, 2)) * self.scale   # [B*H, Sq, Sk]
+        attn = F.softmax(attn, dim=-1)
+        if self.training and self.dropout > 0:
+            attn = F.dropout(attn, p=self.dropout)
+
+        out = torch.bmm(attn, v)                               # [B*H, Sq, dh]
+        out = out.reshape(B, H, Sq, dh).permute(0, 2, 1, 3).reshape(B, Sq, D)
+        return self.out_proj(out), None
+
+
 class MLP(nn.Module):
     def __init__(self, in_dim: int, hidden_dim: int, out_dim: int, num_layers: int) -> None:
         super().__init__()
