@@ -172,9 +172,12 @@ class HungarianCriterion(nn.Module):
         cls      = self._loss_labels(pred_logits, labels, pi, ti, valid)
         l1, ciou = self._loss_boxes(pred_boxes, boxes, pi, ti, valid)
 
+        B, Q, _ = pred_logits.shape
         p = f"{prefix}_" if prefix else ""
         return {
-            f"{p}loss_cls":  cls  / num_boxes * self.cls_w,
+            # cls applies to every query → normalize by B*Q (mean over all positions)
+            f"{p}loss_cls":  cls  / (B * Q) * self.cls_w,
+            # box losses only apply to matched pairs → normalize by num_boxes
             f"{p}loss_l1":   l1   / num_boxes * self.bbox_w,
             f"{p}loss_ciou": ciou / num_boxes * self.giou_w,
         }
