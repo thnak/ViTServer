@@ -32,24 +32,30 @@ class HungarianMatcher(nn.Module):
         pred_boxes: Tensor,    # [B, Q, 4]
         targets: list[dict],   # list of {"labels": [M], "boxes": [M, 4]}
     ) -> list[tuple[Tensor, Tensor]]:
+        # Pull predictions off device once — keeps the entire cost computation on CPU
+        # so XLA sees a single host-callback boundary instead of many mid-graph syncs.
+        # float32 is required; bfloat16 has insufficient precision for the cost matrix.
+        pred_logits = pred_logits.detach().float().cpu()
+        pred_boxes = pred_boxes.detach().float().cpu()
+
         B, Q, C = pred_logits.shape
         indices = []
 
         for b in range(B):
             tgt = targets[b]
-            M = len(tgt["labels"])
+            tgt_cls = tgt["labels"].cpu()    # [M]
+            tgt_boxes = tgt["boxes"].cpu()   # [M, 4]
+            M = len(tgt_cls)
             if M == 0:
                 indices.append((torch.zeros(0, dtype=torch.long), torch.zeros(0, dtype=torch.long)))
                 continue
 
             # Classification cost: focal-style, [Q, M]
-            p = pred_logits[b].sigmoid()        # [Q, C]
-            tgt_cls = tgt["labels"]             # [M]
-            cls_cost = -p[:, tgt_cls]           # [Q, M]
+            p = pred_logits[b].sigmoid()    # [Q, C]
+            cls_cost = -p[:, tgt_cls]       # [Q, M]
 
             # L1 box cost: [Q, M]
-            tgt_boxes = tgt["boxes"].to(pred_boxes.device)   # [M, 4]
-            l1_cost = torch.cdist(pred_boxes[b], tgt_boxes, p=1)  # [Q, M]
+            l1_cost = torch.cdist(pred_boxes[b], tgt_boxes, p=1)
 
             # GIoU cost: [Q, M]
             p_xyxy = box_cxcywh_to_xyxy(pred_boxes[b].unsqueeze(1).expand(-1, M, -1).reshape(-1, 4))
@@ -63,7 +69,7 @@ class HungarianMatcher(nn.Module):
             giou_cost = -giou.reshape(Q, M)
 
             cost = self.cls_w * cls_cost + self.bbox_w * l1_cost + self.giou_w * giou_cost
-            row, col = linear_sum_assignment(cost.cpu().numpy())
+            row, col = linear_sum_assignment(cost.numpy())
             indices.append((
                 torch.as_tensor(row, dtype=torch.long),
                 torch.as_tensor(col, dtype=torch.long),
