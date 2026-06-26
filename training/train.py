@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 from torch.amp import GradScaler
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import yaml
@@ -352,7 +352,14 @@ def main() -> None:
         {"params": [p for n, p in model.named_parameters() if "backbone" not in n], "lr": tc["lr"]},
     ]
     optimizer = AdamW(param_groups, weight_decay=tc["weight_decay"])
-    scheduler = CosineAnnealingLR(optimizer, T_max=tc["epochs"], eta_min=tc["lr"] * 1e-2)
+    warmup_ep = tc.get("warmup_epochs", 0)
+    cosine_ep = max(tc["epochs"] - warmup_ep, 1)
+    cosine = CosineAnnealingLR(optimizer, T_max=cosine_ep, eta_min=tc["lr"] * 1e-2)
+    if warmup_ep > 0:
+        warmup = LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_ep)
+        scheduler = SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[warmup_ep])
+    else:
+        scheduler = cosine
     # AMP: not supported on XLA (TPU uses bfloat16 natively without GradScaler)
     amp_enabled = tc["amp"] and device.type not in ("cpu", "xla")
     scaler = GradScaler(device.type, enabled=amp_enabled) if device.type != "xla" else None

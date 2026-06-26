@@ -262,6 +262,14 @@ class TransformerDecoder(nn.Module):
 
         self.aux_loss = aux_loss
 
+        # Bias cls heads so initial sigmoid output ≈ 0.01 per class.
+        # Without this all 300 queries start at p=0.5 → huge focal loss at
+        # epoch 0 → model learns to suppress everything → box collapse.
+        prior_prob = 0.01
+        bias_value = -math.log((1 - prior_prob) / prior_prob)
+        for head in self.cls_head:
+            nn.init.constant_(head.bias, bias_value)
+
     def forward(self, memory: Tensor) -> dict[str, list[Tensor]]:
         B = memory.shape[0]
         tgt = self.query_embed.weight.unsqueeze(0).expand(B, -1, -1)
