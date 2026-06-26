@@ -57,7 +57,8 @@ def parse_args() -> argparse.Namespace:
         help="Root of COCO dataset (default: data/coco). "
              "Run scripts/download_coco.py first if not present.",
     )
-    p.add_argument("--img_size", type=int, default=1280)
+    p.add_argument("--img_size", type=int, default=None, help="Override img_size from config")
+    p.add_argument("--batch_size", type=int, default=None, help="Override batch_size from config")
     p.add_argument("--resume", default="")
     p.add_argument("--device", default="cuda")
     p.add_argument("--no-val", action="store_true", help="Skip validation (faster iteration)")
@@ -192,6 +193,11 @@ def main() -> None:
     tc = cfg["training"]
     lc = cfg["logging"]
 
+    if args.batch_size is not None:
+        tc["batch_size"] = args.batch_size
+    if args.img_size is not None:
+        cfg["model"]["img_size"] = args.img_size
+
     data_root = Path(args.data_path)
     if not data_root.exists():
         raise SystemExit(
@@ -202,7 +208,7 @@ def main() -> None:
     train_loader = build_dataloader(
         str(data_root / dc["train_img_dir"]),
         str(data_root / dc["train_ann"]),
-        img_size=args.img_size,
+        img_size=cfg["model"]["img_size"],
         batch_size=tc["batch_size"],
         num_workers=dc["num_workers"],
         train=True,
