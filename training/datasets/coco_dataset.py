@@ -47,6 +47,8 @@ class CocoDetection(Dataset):
         ann_ids = self.coco.getAnnIds(imgIds=img_id, iscrowd=False)
         anns = self.coco.loadAnns(ann_ids)
 
+        # Drop degenerate boxes (zero w or h) — albumentations rejects them
+        anns = [a for a in anns if a["bbox"][2] > 0 and a["bbox"][3] > 0]
         bboxes = [a["bbox"] for a in anns]          # [x,y,w,h] pixel, COCO fmt
         labels = [self.cat2idx[a["category_id"]] for a in anns]
 
