@@ -8,6 +8,7 @@ from pathlib import Path
 
 import torch
 import onnx
+import onnx.shape_inference
 import onnxruntime as ort
 import yaml
 
@@ -25,6 +26,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--img_size", type=int, default=1280)
     p.add_argument("--opset", type=int, default=17)
     p.add_argument("--output", default="", help="Output path (default: weights stem + .onnx)")
+    p.add_argument("--no-simplify", action="store_true",
+                   help="Skip onnxsim graph simplification")
     return p.parse_args()
 
 
@@ -127,11 +130,26 @@ def main() -> None:
             dynamo=False,          # use TorchScript path; torch.export fails on 1×1 spatial dims
         )
 
-    # Shape inference — populates type/shape on every intermediate value so
-    # graph viewers (Netron) can display tensor shapes throughout the network.
-    print("Running ONNX shape inference ...")
+    # Post-processing: simplify + shape inference
     model_onnx = onnx.load(out_path)
     onnx.checker.check_model(model_onnx)
+    n_before = len(model_onnx.graph.node)
+
+    if not args.no_simplify:
+        try:
+            import onnxsim
+            print("Running onnxsim ...")
+            model_onnx, ok = onnxsim.simplify(model_onnx)
+            if ok:
+                print(f"  nodes: {n_before} → {len(model_onnx.graph.node)}")
+            else:
+                print("  onnxsim check failed — keeping original graph")
+        except ImportError:
+            print("  onnxsim not installed, skipping (uv pip install onnxsim)")
+
+    # Shape inference fills type/shape on every intermediate value so Netron
+    # can display tensor shapes throughout the network.
+    print("Running ONNX shape inference ...")
     model_onnx = onnx.shape_inference.infer_shapes(model_onnx)
     onnx.save(model_onnx, out_path)
 
