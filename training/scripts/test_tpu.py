@@ -15,10 +15,10 @@ import torch
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
-def _sync(xm):
+def _sync(_xm):
     """Block until all queued XLA ops finish."""
-    xm.mark_step()
-    xm.wait_device_ops()
+    import torch_xla
+    torch_xla.sync(wait=True)
 
 
 def _timed(label: str, fn, xm, warmup: int = 1, runs: int = 5):
@@ -38,15 +38,10 @@ def _timed(label: str, fn, xm, warmup: int = 1, runs: int = 5):
 
 # ── stages ───────────────────────────────────────────────────────────────────
 
-def stage_device(xm):
+def stage_device(_xm):
     print("\n[1] Device")
-    dev = torch.device(xm.xla_device() if hasattr(xm, "xla_device") else "xla:0")
-    # newer API
-    try:
-        import torch_xla
-        dev = torch_xla.device()
-    except Exception:
-        pass
+    import torch_xla
+    dev = torch_xla.device()
     print(f"    device  : {dev}")
     print(f"    dtype   : bfloat16 (TPU native)")
     return dev
@@ -147,12 +142,13 @@ def stage_train_step(dev, xm):
     ]
 
     def step():
+        import torch_xla
         opt.zero_grad()
         out = model(imgs)
         loss = criterion(out, targets)["total"]
         loss.backward()
         opt.step()
-        xm.mark_step()
+        torch_xla.sync()
 
     print("  compiling train graph (first call — may take 2-5 min) …", flush=True)
     t0 = time.perf_counter()

@@ -35,9 +35,7 @@ def _resolve_device(device_arg: str) -> tuple[torch.device, Optional[Callable]]:
     if device_arg == "tpu":
         try:
             import torch_xla
-            import torch_xla.core.xla_model as xm
-            dev = torch_xla.device()
-            return dev, xm.mark_step
+            return torch_xla.device(), torch_xla.sync
         except ImportError:
             raise SystemExit(
                 "torch_xla is required for TPU training.\n"
