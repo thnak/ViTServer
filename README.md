@@ -72,6 +72,7 @@ Recommended serving hardware per variant. FPS estimates assume TensorRT FP16, si
 | **medium @640** | 104 G | 🖥️ Server — RTX 3060 / 4070 | TRT FP16 | Production sweet spot | ~50–80 |
 | **small @640** | 43.8 G | 📦 Edge server — Jetson AGX Orin | TRT INT8 | Edge, near-real-time | ~20–40 |
 | **nano @640** | 19.7 G | 📦 Edge — Jetson Orin NX / Xavier | TRT INT8 | Ultra-edge, power-constrained | ~15–30 |
+| **medium @640** | 104 G | ☁️ Google Colab — TPU v5e-1 | torch_xla bfloat16 | Cloud training (not serving) | ~30–60 |
 | **any** | — | 💻 CPU only (dev / test) | ORT FP32 | Development and CI only | <5 |
 
 > FPS figures are directional estimates; actual throughput depends on batch size, memory bandwidth, driver version, and encoder architecture (see note above). Benchmark with `trtexec --iterations=100` for your specific hardware.
@@ -89,20 +90,22 @@ Recommended serving hardware per variant. FPS estimates assume TensorRT FP16, si
 ```bash
 cd training
 
-# Set up Python environment (requires uv)
-uv venv && uv pip install torch --index-url https://download.pytorch.org/whl/cpu
-uv pip install -r requirements.txt
+# Install dependencies
+pip install torch --index-url https://download.pytorch.org/whl/cpu   # CPU dev
+# or for CUDA 12.1:
+# pip install torch --index-url https://download.pytorch.org/whl/cu121
+pip install -r requirements.txt
 
 # 1. Download COCO 2017 (~19 GB total)
-uv run python scripts/download_coco.py            # → data/coco/
-uv run python scripts/download_coco.py --dest /data/coco  # custom path
+python scripts/download_coco.py               # → data/coco/
+python scripts/download_coco.py --dest /data/coco  # custom path
 
-# 2. Train (--data_path defaults to data/coco)
-uv run python train.py --config configs/custom_model.yaml
-uv run python train.py --no-val        # skip validation for faster iteration
+# 2. Train
+python train.py --config configs/custom_model.yaml --device cuda
+python train.py --no-val        # skip validation for faster iteration
 
 # 3. Export to ONNX
-uv run python export.py \
+python export.py \
     --checkpoint runs/<name>/best.pt \
     --config configs/custom_model.yaml \
     --output runs/<name>/model.onnx
@@ -114,17 +117,48 @@ uv run python export.py \
 cd training
 
 # Generate a tiny synthetic dataset (8 train + 4 val images, no external deps)
-uv run python scripts/create_smoke_dataset.py
+python scripts/create_smoke_dataset.py
 
-# Train for 2 epochs with a 8-channel micro-model on 64×64 images
-uv run python train.py --config configs/smoke_test.yaml --device cpu
+# Train for 2 epochs with an 8-channel micro-model on 64×64 images
+python train.py --config configs/smoke_test.yaml --device cpu
 
 # Export to ONNX
-uv run python export.py \
-    --checkpoint runs/smoke_test/best.pt \
+python export.py \
+    --checkpoint runs/smoke_test/epoch_1.pt \
     --config configs/smoke_test.yaml \
     --output runs/smoke_test/smoke.onnx
 ```
+
+### Google Colab — TPU v5e
+
+Select **TPU v5e** runtime: Runtime → Change runtime type → TPU v5e.
+
+```python
+# Cell 1 — install dependencies
+!pip install torch_xla[tpu] -f https://storage.googleapis.com/libtpu-releases/index.html
+!git clone https://github.com/thnak/ViTServer.git
+%cd ViTServer/training
+!pip install -r requirements.txt
+
+# Cell 2 — download COCO (or mount Drive with a pre-downloaded copy)
+!python scripts/download_coco.py --dest data/coco
+
+# Cell 3 — train on TPU v5e-1
+!python train.py \
+    --config configs/custom_model.yaml \
+    --device tpu \
+    --data_path data/coco
+```
+
+`--device tpu` automatically:
+- Loads `torch_xla` and acquires the XLA device (`xla:0` on a v5e-1 chip)
+- Disables AMP and GradScaler (not supported on XLA; TPU uses bfloat16 natively)
+- Calls `xm.mark_step()` after each optimizer step to flush the lazy evaluation graph
+
+**Tips for Colab TPU:**
+- Use `batch_size: 8` or larger — TPU v5e-1 has 16 GB HBM and favors large batches
+- Set `num_workers: 0` in the data config (Colab TPU workers don't support `fork`)
+- Export is still done on CPU/GPU after training (`python export.py --device cpu ...`)
 
 ---
 

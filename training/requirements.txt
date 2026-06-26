@@ -6,6 +6,9 @@ onnxsim>=0.3.8             # ONNX graph simplification (used by export.py; optio
 scipy>=1.13.0
 numpy>=1.26.0
 
+# TPU (Google Colab v5e — install separately, version must match torch)
+# pip install torch_xla[tpu] -f https://storage.googleapis.com/libtpu-releases/index.html
+
 # Data loading & augmentation
 opencv-python>=4.10.0
 Pillow>=10.3.0

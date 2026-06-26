@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import math
 from copy import deepcopy
 from pathlib import Path
+from typing import Callable, Optional
 
 import torch
 import torch.nn as nn
@@ -22,6 +24,28 @@ from losses import HungarianCriterion
 from losses.hungarian import HungarianMatcher
 from datasets import build_dataloader
 from utils import MeanAveragePrecision
+
+
+def _resolve_device(device_arg: str) -> tuple[torch.device, Optional[Callable]]:
+    """Return (device, mark_step_fn).
+
+    mark_step_fn is xm.mark_step for XLA/TPU (must be called after each
+    optimizer step to flush the lazy graph), None for all other devices.
+    """
+    if device_arg == "tpu":
+        try:
+            import torch_xla.core.xla_model as xm
+            return xm.xla_device(), xm.mark_step
+        except ImportError:
+            raise SystemExit(
+                "torch_xla is required for TPU training.\n"
+                "  pip install torch_xla[tpu] "
+                "-f https://storage.googleapis.com/libtpu-releases/index.html"
+            )
+    if device_arg == "cuda" and not torch.cuda.is_available():
+        print("CUDA not available, falling back to CPU")
+        return torch.device("cpu"), None
+    return torch.device(device_arg), None
 
 
 def parse_args() -> argparse.Namespace:
@@ -76,12 +100,13 @@ def train_one_epoch(
     criterion: nn.Module,
     loader,
     optimizer: torch.optim.Optimizer,
-    scaler: GradScaler,
+    scaler: Optional[GradScaler],
     device: torch.device,
     epoch: int,
     amp_enabled: bool = True,
     grad_accum: int = 1,
     clip_norm: float = 0.1,
+    mark_step_fn: Optional[Callable] = None,
 ) -> dict[str, float]:
     model.train()
     criterion.train()
@@ -92,19 +117,29 @@ def train_one_epoch(
         images = images.to(device, non_blocking=True)
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
-        with torch.autocast(device.type, enabled=amp_enabled):
+        ac = torch.autocast(device.type, enabled=amp_enabled) if amp_enabled else contextlib.nullcontext()
+        with ac:
             outputs = model(images)
             losses = criterion(outputs, targets)
 
         loss = losses["total"] / grad_accum
-        scaler.scale(loss).backward()
+        if scaler is not None:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
 
         if (step + 1) % grad_accum == 0:
-            scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
-            scaler.step(optimizer)
-            scaler.update()
+            if scaler is not None:
+                scaler.unscale_(optimizer)
+                nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
+                optimizer.step()
             optimizer.zero_grad()
+            if mark_step_fn is not None:
+                mark_step_fn()
 
         for k, v in losses.items():
             totals[k] = totals.get(k, 0.0) + v.item()
@@ -125,7 +160,8 @@ def validate(
     metric = MeanAveragePrecision(ann_file)
     for images, targets in tqdm(loader, desc="Val"):
         images = images.to(device, non_blocking=True)
-        with torch.autocast(device.type, enabled=amp_enabled):
+        ac = torch.autocast(device.type, enabled=amp_enabled) if amp_enabled else contextlib.nullcontext()
+        with ac:
             out = model(images)
         scores = out["pred_logits"].sigmoid()
         ids = [t["image_id"].item() for t in targets]
@@ -147,7 +183,7 @@ class EMA:
 
 def main() -> None:
     args = parse_args()
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    device, mark_step_fn = _resolve_device(args.device)
 
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
@@ -190,8 +226,9 @@ def main() -> None:
     ]
     optimizer = AdamW(param_groups, weight_decay=tc["weight_decay"])
     scheduler = CosineAnnealingLR(optimizer, T_max=tc["epochs"], eta_min=tc["lr"] * 1e-2)
-    amp_enabled = tc["amp"] and device.type != "cpu"
-    scaler = GradScaler(device.type, enabled=amp_enabled)
+    # AMP: not supported on XLA (TPU uses bfloat16 natively without GradScaler)
+    amp_enabled = tc["amp"] and device.type not in ("cpu", "xla")
+    scaler = GradScaler(device.type, enabled=amp_enabled) if device.type != "xla" else None
     ema = EMA(model, tc["ema_decay"]) if tc["ema"] else None
 
     save_dir = Path(lc["save_dir"]) / lc["project"]
@@ -215,6 +252,7 @@ def main() -> None:
             amp_enabled=amp_enabled,
             grad_accum=tc["grad_accumulate"],
             clip_norm=tc["clip_grad_norm"],
+            mark_step_fn=mark_step_fn,
         )
         scheduler.step()
 
