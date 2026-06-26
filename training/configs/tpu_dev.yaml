@@ -1,0 +1,57 @@
+# TPU v5e development config — fast compile, COCO mini subset
+# Build subset first: python scripts/create_coco_subset.py --data_path data/coco
+# Train: python train.py --config configs/tpu_dev.yaml --device tpu --data_path data/coco
+
+model:
+  img_size: 640
+  in_channels: 3
+  base_channels: 32
+  embed_dim: 128
+  num_heads: 4
+  encoder_type: none
+  num_encoder_layers: 0
+  window_size: 8
+  num_decoder_layers: 3          # fewer aux losses = fewer matcher calls per step
+  num_queries: 100
+  num_classes: 80
+  dropout: 0.0
+  aux_loss: false                # eliminates 3 extra CPU→XLA round trips per step
+
+training:
+  epochs: 50
+  batch_size: 8                  # v5e-1 has 16 GB; 640px fits larger batches
+  grad_accumulate: 2             # effective batch = 16
+  optimizer: adamw
+  lr: 1.0e-4
+  lr_backbone: 1.0e-5
+  weight_decay: 1.0e-4
+  lr_scheduler: cosine
+  warmup_epochs: 3
+  ema: false
+  ema_decay: 0.9999
+  amp: false                     # TPU uses bfloat16 natively; amp not supported on XLA
+  clip_grad_norm: 0.1
+
+loss:
+  cls_weight: 2.0
+  bbox_weight: 5.0
+  giou_weight: 2.0
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+  matcher_cls_weight: 2.0
+  matcher_bbox_weight: 5.0
+  matcher_giou_weight: 2.0
+
+data:
+  train_ann: annotations/instances_train2017_mini.json
+  val_ann: annotations/instances_val2017_mini.json
+  train_img_dir: images/train2017
+  val_img_dir: images/val2017
+  num_workers: 0                 # must be 0 on XLA
+  pin_memory: false
+
+logging:
+  project: tpu_dev
+  save_dir: runs/
+  save_period: 5
+  val_period: 5
