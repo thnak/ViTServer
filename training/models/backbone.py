@@ -43,7 +43,7 @@ class C2f(nn.Module):
         super().__init__()
         half = out_c // 2
         self.cv1 = ConvBnSiLU(in_c, out_c, 1, p=0)
-        self.cv2 = ConvBnSiLU((1 + n) * half, out_c, 1, p=0)
+        self.cv2 = ConvBnSiLU((2 + n) * half, out_c, 1, p=0)
         self.blocks = nn.ModuleList(Bottleneck(half) for _ in range(n))
 
     def forward(self, x: Tensor) -> Tensor:

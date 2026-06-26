@@ -10,7 +10,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler
+from torch.amp import GradScaler
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.tensorboard import SummaryWriter
@@ -77,6 +77,7 @@ def train_one_epoch(
     scaler: GradScaler,
     device: torch.device,
     epoch: int,
+    amp_enabled: bool = True,
     grad_accum: int = 1,
     clip_norm: float = 0.1,
 ) -> dict[str, float]:
@@ -89,7 +90,7 @@ def train_one_epoch(
         images = images.to(device, non_blocking=True)
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
-        with torch.cuda.amp.autocast():
+        with torch.autocast(device.type, enabled=amp_enabled):
             outputs = model(images)
             losses = criterion(outputs, targets)
 
@@ -116,12 +117,13 @@ def validate(
     loader,
     device: torch.device,
     ann_file: str,
+    amp_enabled: bool = True,
 ) -> dict[str, float]:
     model.eval()
     metric = MeanAveragePrecision(ann_file)
     for images, targets in tqdm(loader, desc="Val"):
         images = images.to(device, non_blocking=True)
-        with torch.cuda.amp.autocast():
+        with torch.autocast(device.type, enabled=amp_enabled):
             out = model(images)
         scores = out["pred_logits"].sigmoid()
         ids = [t["image_id"].item() for t in targets]
@@ -186,7 +188,8 @@ def main() -> None:
     ]
     optimizer = AdamW(param_groups, weight_decay=tc["weight_decay"])
     scheduler = CosineAnnealingLR(optimizer, T_max=tc["epochs"], eta_min=tc["lr"] * 1e-2)
-    scaler = GradScaler(enabled=tc["amp"])
+    amp_enabled = tc["amp"] and device.type != "cpu"
+    scaler = GradScaler(device.type, enabled=amp_enabled)
     ema = EMA(model, tc["ema_decay"]) if tc["ema"] else None
 
     save_dir = Path(lc["save_dir"]) / lc["project"]
@@ -207,6 +210,7 @@ def main() -> None:
     for epoch in range(start_epoch, tc["epochs"]):
         train_metrics = train_one_epoch(
             model, criterion, train_loader, optimizer, scaler, device, epoch,
+            amp_enabled=amp_enabled,
             grad_accum=tc["grad_accumulate"],
             clip_norm=tc["clip_grad_norm"],
         )
@@ -220,7 +224,7 @@ def main() -> None:
 
         if not args.no_val and (epoch + 1) % lc["val_period"] == 0:
             eval_model = ema.ema if ema else model
-            val_metrics = validate(eval_model, val_loader, device, str(data_root / dc["val_ann"]))
+            val_metrics = validate(eval_model, val_loader, device, str(data_root / dc["val_ann"]), amp_enabled=amp_enabled)
             for k, v in val_metrics.items():
                 writer.add_scalar(f"val/{k}", v, epoch)
             print(f"Epoch {epoch} | {val_metrics}")

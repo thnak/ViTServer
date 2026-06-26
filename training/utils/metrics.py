@@ -11,7 +11,7 @@ from torch import Tensor
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
 
-from ..losses.bbox_loss import box_cxcywh_to_xyxy
+from losses.bbox_loss import box_cxcywh_to_xyxy
 
 
 class MeanAveragePrecision:

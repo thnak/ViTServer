@@ -25,9 +25,9 @@ inference-server/*.engine
 *.o
 *.a
 
-# Datasets
-data/
-datasets/
+# Datasets (root-level only; training/datasets/ is a Python package)
+/data/
+/datasets/
 
 # Editors
 .vscode/
