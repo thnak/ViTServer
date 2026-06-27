@@ -1,0 +1,60 @@
+# COCO mini — real-image training verification (val2017 split, 4000 train / 1000 val)
+# Download:  python scripts/download_coco_mini.py
+# Train:     python train.py --config configs/coco_mini.yaml --data_path data/coco_mini --device cuda
+#
+# Purpose: verify that loss decreases on real images before committing to full COCO.
+# Nano-tier model, 80 classes, AMP on — mirrors production config at small scale.
+
+model:
+  img_size: 416
+  in_channels: 3
+  base_channels: 16
+  embed_dim: 64
+  num_heads: 2
+  encoder_type: none
+  num_encoder_layers: 0
+  window_size: 8
+  num_decoder_layers: 6
+  num_queries: 100
+  num_classes: 80
+  dropout: 0.0
+  aux_loss: true
+
+training:
+  epochs: 30
+  batch_size: 8
+  grad_accumulate: 2             # effective batch = 16
+  optimizer: adamw
+  lr: 1.0e-4
+  lr_backbone: 1.0e-5
+  weight_decay: 1.0e-4
+  lr_scheduler: cosine
+  warmup_epochs: 3
+  ema: false
+  ema_decay: 0.9999
+  amp: true
+  clip_grad_norm: 0.1
+
+loss:
+  cls_weight: 2.0
+  bbox_weight: 5.0
+  giou_weight: 2.0
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+  matcher_cls_weight: 2.0
+  matcher_bbox_weight: 5.0
+  matcher_giou_weight: 2.0
+
+data:
+  train_ann: annotations/instances_train2017.json
+  val_ann: annotations/instances_val2017.json
+  train_img_dir: images/train2017
+  val_img_dir: images/val2017
+  num_workers: 2
+  pin_memory: true
+
+logging:
+  project: coco_mini
+  save_dir: runs/
+  save_period: 5
+  val_period: 5
