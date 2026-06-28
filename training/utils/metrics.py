@@ -18,6 +18,9 @@ class MeanAveragePrecision:
     def __init__(self, ann_file: str) -> None:
         self.gt_coco = COCO(ann_file)
         self.results: list[dict] = []
+        # Reverse the dataset's cat2idx: contiguous model label → real COCO category id
+        cats = sorted(self.gt_coco.cats.keys())
+        self.idx2cat: dict[int, int] = {i: c for i, c in enumerate(cats)}
 
     def update(
         self,
@@ -43,7 +46,7 @@ class MeanAveragePrecision:
                 x1, y1, x2, y2 = box
                 self.results.append({
                     "image_id": image_ids[b],
-                    "category_id": label + 1,          # COCO categories are 1-indexed
+                    "category_id": self.idx2cat[label],
                     "bbox": [x1, y1, x2 - x1, y2 - y1],
                     "score": round(score, 4),
                 })
