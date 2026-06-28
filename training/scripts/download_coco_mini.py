@@ -181,7 +181,8 @@ def main() -> None:
         if not val_zip.exists():
             _download(_VAL_IMAGES_URL, val_zip, "val2017 images (~1 GB)")
         _extract(val_zip, tmp)
-        (tmp / "val2017").rename(dest / "images" / "val2017_all")
+        (dest / "images").mkdir(parents=True, exist_ok=True)
+        shutil.move(str(tmp / "val2017"), str(dest / "images" / "val2017_all"))
         if not args.keep_zips:
             val_zip.unlink()
     else:
@@ -196,7 +197,7 @@ def main() -> None:
         _extract(ann_zip, tmp)
         ann_src = tmp / "annotations" / "instances_val2017.json"
         raw_ann.parent.mkdir(parents=True, exist_ok=True)
-        ann_src.rename(raw_ann)
+        shutil.move(str(ann_src), str(raw_ann))
         # clean up unneeded annotation files
         shutil.rmtree(tmp / "annotations", ignore_errors=True)
         if not args.keep_zips:
