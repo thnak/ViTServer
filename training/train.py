@@ -41,20 +41,38 @@ def _denormalize_to_uint8(img: Tensor) -> np.ndarray:
 
 
 def _draw_pred_vs_gt(
-    img: np.ndarray, pred_boxes: Tensor, pred_scores: Tensor, gt_boxes: Tensor, score_thresh: float = 0.3,
+    img: np.ndarray,
+    pred_boxes: Tensor, pred_scores: Tensor, pred_labels: Tensor,
+    gt_boxes: Tensor, gt_labels: Tensor,
+    top_k: int = 10, score_thresh: float = 0.05,
 ) -> np.ndarray:
-    """Red = predictions above score_thresh, green = ground truth. Boxes are xyxy pixel
-    coords in the model's own (letterboxed) input space — not unletterboxed to the
-    original image, so this only checks localisation quality, not the eval-time decode."""
+    """Red = the model's top_k highest-confidence queries (labelled class:score),
+    green = ground truth (labelled gt:class). Always draws the model's best guesses
+    regardless of how low-confidence they are — early in training nothing may clear
+    a fixed threshold, and an image with only GT boxes and no predictions reads as
+    "nothing was detected" when really everything just scored low.
+
+    Boxes are xyxy pixel coords in the model's own (letterboxed) input space — not
+    unletterboxed to the original image, so this checks localisation quality against
+    what the model actually sees, not the eval-time decode in utils/metrics.py."""
     vis = img.copy()
-    for box, score in zip(pred_boxes.tolist(), pred_scores.tolist()):
+    cv2.putText(vis, "red=pred  green=GT", (4, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
+
+    order = pred_scores.argsort(descending=True)[:top_k].tolist()
+    for idx in order:
+        score = pred_scores[idx].item()
         if score < score_thresh:
             continue
-        x1, y1, x2, y2 = map(int, box)
-        cv2.rectangle(vis, (x1, y1), (x2, y2), (255, 56, 56), 2)
-    for box in gt_boxes.tolist():
+        x1, y1, x2, y2 = map(int, pred_boxes[idx].tolist())
+        cv2.rectangle(vis, (x1, y1), (x2, y2), (255, 56, 56), 1)
+        cv2.putText(vis, f"{pred_labels[idx].item()}:{score:.2f}", (x1, max(10, y1 - 3)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 56, 56), 1, cv2.LINE_AA)
+
+    for box, label in zip(gt_boxes.tolist(), gt_labels.tolist()):
         x1, y1, x2, y2 = map(int, box)
         cv2.rectangle(vis, (x1, y1), (x2, y2), (61, 219, 134), 1)
+        cv2.putText(vis, f"gt:{label}", (x1, min(vis.shape[0] - 2, y2 + 10)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (61, 219, 134), 1, cv2.LINE_AA)
     return vis
 
 
@@ -219,11 +237,17 @@ def validate(
 
         if writer is not None and logged < max_vis:
             pred_boxes_px = box_cxcywh_to_xyxy(out["pred_boxes"]) * img_size  # [B, Q, 4]
+            pred_scores_all, pred_labels_all = scores.max(dim=-1)             # [B, Q], [B, Q]
             for i in range(min(max_vis - logged, images.shape[0])):
                 img_np = _denormalize_to_uint8(images[i])
                 valid = targets[i]["valid"]
                 gt_boxes_px = box_cxcywh_to_xyxy(targets[i]["boxes"][valid]) * img_size
-                vis = _draw_pred_vs_gt(img_np, pred_boxes_px[i].cpu(), scores[i].max(dim=-1).values.cpu(), gt_boxes_px.cpu())
+                gt_labels_i = targets[i]["labels"][valid]
+                vis = _draw_pred_vs_gt(
+                    img_np,
+                    pred_boxes_px[i].cpu(), pred_scores_all[i].cpu(), pred_labels_all[i].cpu(),
+                    gt_boxes_px.cpu(), gt_labels_i.cpu(),
+                )
                 writer.add_image(f"val/sample_{logged}", vis, epoch, dataformats="HWC")
                 logged += 1
     return metric.compute()
