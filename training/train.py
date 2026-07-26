@@ -95,6 +95,7 @@ def build_model_and_criterion(cfg: dict, device: torch.device):
         giou_weight=lc["giou_weight"],
         focal_alpha=lc["focal_alpha"],
         focal_gamma=lc["focal_gamma"],
+        no_obj_weight=lc.get("no_obj_weight", 0.5),
     ).to(device)
 
     return model, criterion
@@ -118,7 +119,7 @@ def train_one_epoch(
     totals: dict[str, float] = {}
     optimizer.zero_grad()
 
-    pbar = tqdm(loader, desc=f"Epoch {epoch}")
+    pbar = tqdm(loader, desc=f"Epoch {epoch}", mininterval=2.0)
     for step, (images, targets) in enumerate(pbar):
         images = images.to(device, non_blocking=True)
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
@@ -156,7 +157,7 @@ def train_one_epoch(
     return {k: v / n for k, v in totals.items()}
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def validate(
     model: nn.Module,
     loader,
@@ -171,7 +172,7 @@ def validate(
         ac = torch.autocast(device.type, enabled=amp_enabled) if amp_enabled else contextlib.nullcontext()
         with ac:
             out = model(images)
-        scores = out["pred_logits"].sigmoid()
+        scores = out["pred_logits"].sigmoid()[:, :, :-1]  # exclude ∅ channel
         ids = [t["image_id"].item() for t in targets]
         orig = torch.stack([t["orig_size"] for t in targets])
         metric.update(out["pred_boxes"].cpu(), scores.cpu(), ids, orig)
@@ -290,6 +291,19 @@ def main() -> None:
     args = parse_args()
     device, mark_step_fn = _resolve_device(args.device)
 
+    # ── GPU optimizations ────────────────────────────────────────────────
+    if device.type == "cuda":
+        # cuDNN benchmark selects the fastest kernel for each op shape
+        torch.backends.cudnn.benchmark = True
+        # Avoid blocking sync (we never .item() mid-batch)
+        torch.backends.cudnn.deterministic = False
+        # Enable TF32 on supported GPUs (RTX 4060: sm89 Ampere+)
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
+        # Small GPU cache trim to keep fragmentation low
+        torch.cuda.set_per_process_memory_fraction(0.95)
+
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
 
@@ -320,6 +334,7 @@ def main() -> None:
         num_workers=num_workers,
         train=True,
         pin_memory=pin_memory,
+        data_config=dc,
     )
     val_loader = None
     if not args.no_val:
@@ -331,6 +346,7 @@ def main() -> None:
             num_workers=num_workers,
             train=False,
             pin_memory=pin_memory,
+            data_config=dc,
         )
 
     model, criterion = build_model_and_criterion(cfg, device)

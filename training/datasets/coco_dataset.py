@@ -108,10 +108,11 @@ def build_dataloader(
     num_workers: int = 8,
     train: bool = True,
     pin_memory: bool = True,
+    data_config: dict | None = None,
 ) -> DataLoader:
     dataset = CocoDetection(img_dir, ann_file, img_size, train)
-    return DataLoader(
-        dataset,
+    _dc = data_config or {}
+    loader_kwargs = dict(
         batch_size=batch_size,
         shuffle=train,
         num_workers=num_workers,
@@ -119,3 +120,8 @@ def build_dataloader(
         collate_fn=collate_fn,
         drop_last=train,
     )
+    # prefetch_factor and persistent_workers only valid when num_workers > 0
+    if num_workers > 0:
+        loader_kwargs["prefetch_factor"] = _dc.get("prefetch_factor", 2)
+        loader_kwargs["persistent_workers"] = _dc.get("persistent_workers", False)
+    return DataLoader(dataset, **loader_kwargs)

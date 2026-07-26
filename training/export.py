@@ -71,7 +71,7 @@ class ExportWrapper(torch.nn.Module):
         # x: [B, 3, H, W] NCHW
         out = self.model(x)
         boxes = out["pred_boxes"]               # [B, Q, 4]
-        scores = out["pred_logits"].sigmoid()   # [B, Q, C]
+        scores = out["pred_logits"].sigmoid()[:, :, :-1]   # [B, Q, C] — exclude ∅ channel
         return boxes, scores
 
 

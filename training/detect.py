@@ -153,7 +153,7 @@ def detect_image(
     tensor = result["image"].unsqueeze(0).to(device)   # [1, 3, H, W]
 
     out = model(tensor)
-    scores_all = out["pred_logits"][0].sigmoid()        # [Q, C]
+    scores_all = out["pred_logits"][0].sigmoid()[:, :-1]    # [Q, C] — exclude ∅ channel
     boxes_all  = out["pred_boxes"][0]                   # [Q, 4]
 
     scores, class_ids = scores_all.max(dim=-1)          # [Q]

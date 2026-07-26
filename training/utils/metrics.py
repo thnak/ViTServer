@@ -32,7 +32,7 @@ class MeanAveragePrecision:
         B = pred_boxes.shape[0]
         for b in range(B):
             h, w = orig_sizes[b].tolist()
-            scores, labels = pred_scores[b].max(dim=-1)  # [Q], [Q]
+            scores, labels = pred_scores[b][:, :-1].max(dim=-1)  # [Q], [Q] — exclude ∅ channel
             boxes_xyxy = box_cxcywh_to_xyxy(pred_boxes[b])  # [Q, 4] normalised
 
             # Scale to pixels

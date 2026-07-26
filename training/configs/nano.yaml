@@ -19,7 +19,7 @@ model:
 
 training:
   epochs: 500
-  batch_size: 16
+  batch_size: 32
   grad_accumulate: 2             # effective batch = 32
   optimizer: adamw
   lr: 1.0e-4
@@ -47,7 +47,7 @@ data:
   val_ann: annotations/instances_val2017.json
   train_img_dir: images/train2017
   val_img_dir: images/val2017
-  num_workers: 8
+  num_workers: 4
   pin_memory: true
 
 logging:

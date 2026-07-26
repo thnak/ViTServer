@@ -256,19 +256,37 @@ class TransformerDecoder(nn.Module):
         self.bbox_head = nn.ModuleList(
             MLP(d, d, 4, 3) for _ in range(num_layers)
         )
+        # num_classes + 1: the extra channel is "no-object" (∅).
+        # Unmatched queries learn to predict ∅; matched queries predict a real class.
         self.cls_head = nn.ModuleList(
-            nn.Linear(d, num_classes) for _ in range(num_layers)
+            nn.Linear(d, num_classes + 1) for _ in range(num_layers)
         )
 
         self.aux_loss = aux_loss
 
-        # Bias cls heads so initial sigmoid output ≈ 0.01 per class.
-        # Without this all 300 queries start at p=0.5 → huge focal loss at
-        # epoch 0 → model learns to suppress everything → box collapse.
+        # Bias cls heads:
+        #   Real classes → sigmoid ≈ 0.01 (low confidence, avoid initial false positives)
+        #   ∅ channel    → sigmoid ≈ 0.99 (high no-object confidence since most queries are unmatched)
+        # Without this bias, all channels start at p=0.5 → huge focal loss at epoch 0.
         prior_prob = 0.01
-        bias_value = -math.log((1 - prior_prob) / prior_prob)
+        bias_low  = -math.log((1 - prior_prob) / prior_prob)     # ≈ -4.6
+        bias_high = -math.log(prior_prob / (1 - prior_prob))     # ≈ +4.6
         for head in self.cls_head:
-            nn.init.constant_(head.bias, bias_value)
+            nn.init.constant_(head.bias, bias_low)
+            with torch.no_grad():
+                head.bias[-1] = bias_high  # ∅ channel starts confident
+
+        # Re-initialize bbox_head with larger weights so different query
+        # embeddings produce diverse box predictions from the start.
+        # Default nn.Linear init (U(-1/√fan_in, 1/√fan_in)) gives tiny
+        # variance for 64-dim inputs → all queries predict ~0.5 after
+        # sigmoid → Hungarian matcher sees uniform boxes → model never
+        # learns spatial diversity (box-collapse failure mode).
+        for mlp in self.bbox_head:
+            for layer in mlp.layers:
+                nn.init.xavier_uniform_(layer.weight, gain=1.0)
+                if layer.bias is not None:
+                    nn.init.constant_(layer.bias, 0.0)
 
     def forward(self, memory: Tensor) -> dict[str, list[Tensor]]:
         B = memory.shape[0]
