@@ -8,9 +8,9 @@
 model:
   img_size: 416
   in_channels: 3
-  base_channels: 16
-  embed_dim: 64
-  num_heads: 2
+  base_channels: 32
+  embed_dim: 128
+  num_heads: 4
   encoder_type: none
   num_encoder_layers: 0
   window_size: 8
@@ -33,7 +33,7 @@ training:
   ema: true
   ema_decay: 0.9999
   amp: true
-  clip_grad_norm: 0.1
+  clip_grad_norm: 1.0
 
 loss:
   cls_weight: 2.0
