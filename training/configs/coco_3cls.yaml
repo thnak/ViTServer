@@ -11,8 +11,8 @@ model:
   base_channels: 32
   embed_dim: 128
   num_heads: 4
-  encoder_type: none
-  num_encoder_layers: 0
+  encoder_type: window
+  num_encoder_layers: 2
   window_size: 8
   num_decoder_layers: 6
   num_queries: 50
