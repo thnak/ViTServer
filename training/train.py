@@ -145,6 +145,7 @@ def train_one_epoch(
     grad_accum: int = 1,
     clip_norm: float = 0.1,
     mark_step_fn: Optional[Callable] = None,
+    ema: Optional["EMA"] = None,
 ) -> dict[str, float]:
     model.train()
     criterion.train()
@@ -177,6 +178,8 @@ def train_one_epoch(
                 nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
                 optimizer.step()
             optimizer.zero_grad()
+            if ema is not None:
+                ema.update(model)
             if mark_step_fn is not None:
                 mark_step_fn()
 
@@ -469,11 +472,9 @@ def main() -> None:
             grad_accum=tc["grad_accumulate"],
             clip_norm=tc["clip_grad_norm"],
             mark_step_fn=mark_step_fn,
+            ema=ema,
         )
         scheduler.step()
-
-        if ema:
-            ema.update(model)
 
         print_epoch_row(epoch, tc["epochs"], train_metrics, current_lr)
 

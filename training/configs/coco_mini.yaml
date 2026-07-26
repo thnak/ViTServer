@@ -4,8 +4,9 @@
 # Resume:    python train.py --config configs/coco_mini.yaml --data_path data/coco_mini --resume runs/coco_mini/last.pt --device cuda
 #
 # Purpose: verify that loss decreases on real images and mAP becomes non-zero.
-# 150 epochs gives the cosine schedule room to work; first non-zero mAP expected ~epoch 60-80.
-# Training from scratch (no pretrained backbone) needs this many epochs to converge.
+# Training from scratch (no pretrained backbone) needs many epochs to converge fully,
+# but non-zero mAP should already show up within the first few val_period checks now
+# that the eval-time letterbox decode and per-step EMA update are both fixed.
 
 model:
   img_size: 416
@@ -33,7 +34,7 @@ training:
   lr_scheduler: cosine
   warmup_epochs: 5
   ema: true
-  ema_decay: 0.9999
+  ema_decay: 0.999
   amp: true
   clip_grad_norm: 0.1
 
