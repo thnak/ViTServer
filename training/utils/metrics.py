@@ -15,8 +15,9 @@ from losses.bbox_loss import box_cxcywh_to_xyxy
 
 
 class MeanAveragePrecision:
-    def __init__(self, ann_file: str) -> None:
+    def __init__(self, ann_file: str, img_size: int) -> None:
         self.gt_coco = COCO(ann_file)
+        self.img_size = img_size
         self.results: list[dict] = []
         # Reverse the dataset's cat2idx: contiguous model label → real COCO category id
         cats = sorted(self.gt_coco.cats.keys())
@@ -24,20 +25,31 @@ class MeanAveragePrecision:
 
     def update(
         self,
-        pred_boxes: Tensor,     # [B, Q, 4] cx,cy,w,h normalised
+        pred_boxes: Tensor,     # [B, Q, 4] cx,cy,w,h normalised to the padded img_size square
         pred_scores: Tensor,    # [B, Q, C] sigmoid scores
         image_ids: list[int],
-        orig_sizes: Tensor,     # [B, 2] H, W
+        orig_sizes: Tensor,     # [B, 2] H, W (pre-letterbox)
     ) -> None:
         B = pred_boxes.shape[0]
         for b in range(B):
             h, w = orig_sizes[b].tolist()
             scores, labels = pred_scores[b][:, :-1].max(dim=-1)  # [Q], [Q] — exclude ∅ channel
-            boxes_xyxy = box_cxcywh_to_xyxy(pred_boxes[b])  # [Q, 4] normalised
+            boxes_xyxy = box_cxcywh_to_xyxy(pred_boxes[b])  # [Q, 4] normalised, padded-square space
 
-            # Scale to pixels
-            scale = torch.tensor([w, h, w, h], device=boxes_xyxy.device, dtype=torch.float32)
-            boxes_px = (boxes_xyxy * scale).clamp(min=0)
+            # Undo LongestMaxSize + PadIfNeeded (see datasets/transforms.py) to recover
+            # original-image pixel coords — must match detect.py's boxes_to_orig().
+            scale = self.img_size / max(h, w)
+            new_h, new_w = round(h * scale), round(w * scale)
+            pad_top  = (self.img_size - new_h) // 2
+            pad_left = (self.img_size - new_w) // 2
+
+            boxes_pad_px = boxes_xyxy * self.img_size  # → pixel space of the padded square
+            offset = torch.tensor(
+                [pad_left, pad_top, pad_left, pad_top], device=boxes_pad_px.device, dtype=torch.float32
+            )
+            boxes_px = (boxes_pad_px - offset) / scale
+            boxes_px[:, [0, 2]] = boxes_px[:, [0, 2]].clamp(0, w)
+            boxes_px[:, [1, 3]] = boxes_px[:, [1, 3]].clamp(0, h)
 
             keep = scores > 0.01
             for box, score, label in zip(

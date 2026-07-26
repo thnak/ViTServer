@@ -11,8 +11,11 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Callable, Optional
 
+import cv2
+import numpy as np
 import torch
 import torch.nn as nn
+from torch import Tensor
 from torch.amp import GradScaler
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
@@ -22,9 +25,37 @@ import yaml
 
 from models import NMSFreeDetector
 from losses import HungarianCriterion
+from losses.bbox_loss import box_cxcywh_to_xyxy
 from losses.hungarian import HungarianMatcher
 from datasets import build_dataloader
 from utils import MeanAveragePrecision
+
+# Must match datasets/transforms.py's A.Normalize
+_IMG_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+_IMG_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+
+
+def _denormalize_to_uint8(img: Tensor) -> np.ndarray:
+    img = (img.cpu() * _IMG_STD + _IMG_MEAN).clamp(0, 1)
+    return (img.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+
+
+def _draw_pred_vs_gt(
+    img: np.ndarray, pred_boxes: Tensor, pred_scores: Tensor, gt_boxes: Tensor, score_thresh: float = 0.3,
+) -> np.ndarray:
+    """Red = predictions above score_thresh, green = ground truth. Boxes are xyxy pixel
+    coords in the model's own (letterboxed) input space — not unletterboxed to the
+    original image, so this only checks localisation quality, not the eval-time decode."""
+    vis = img.copy()
+    for box, score in zip(pred_boxes.tolist(), pred_scores.tolist()):
+        if score < score_thresh:
+            continue
+        x1, y1, x2, y2 = map(int, box)
+        cv2.rectangle(vis, (x1, y1), (x2, y2), (255, 56, 56), 2)
+    for box in gt_boxes.tolist():
+        x1, y1, x2, y2 = map(int, box)
+        cv2.rectangle(vis, (x1, y1), (x2, y2), (61, 219, 134), 1)
+    return vis
 
 
 def _resolve_device(device_arg: str) -> tuple[torch.device, Optional[Callable]]:
@@ -164,10 +195,15 @@ def validate(
     loader,
     device: torch.device,
     ann_file: str,
+    img_size: int,
     amp_enabled: bool = True,
+    writer: SummaryWriter | None = None,
+    epoch: int | None = None,
+    max_vis: int = 4,
 ) -> dict[str, float]:
     model.eval()
-    metric = MeanAveragePrecision(ann_file)
+    metric = MeanAveragePrecision(ann_file, img_size)
+    logged = 0
     for images, targets in tqdm(loader, desc="Val"):
         images = images.to(device, non_blocking=True)
         ac = torch.autocast(device.type, enabled=amp_enabled) if amp_enabled else contextlib.nullcontext()
@@ -177,6 +213,16 @@ def validate(
         ids = [t["image_id"].item() for t in targets]
         orig = torch.stack([t["orig_size"] for t in targets])
         metric.update(out["pred_boxes"].cpu(), scores.cpu(), ids, orig)
+
+        if writer is not None and logged < max_vis:
+            pred_boxes_px = box_cxcywh_to_xyxy(out["pred_boxes"]) * img_size  # [B, Q, 4]
+            for i in range(min(max_vis - logged, images.shape[0])):
+                img_np = _denormalize_to_uint8(images[i])
+                valid = targets[i]["valid"]
+                gt_boxes_px = box_cxcywh_to_xyxy(targets[i]["boxes"][valid]) * img_size
+                vis = _draw_pred_vs_gt(img_np, pred_boxes_px[i].cpu(), scores[i].max(dim=-1).values.cpu(), gt_boxes_px.cpu())
+                writer.add_image(f"val/sample_{logged}", vis, epoch, dataformats="HWC")
+                logged += 1
     return metric.compute()
 
 
@@ -436,7 +482,11 @@ def main() -> None:
 
         if not args.no_val and (epoch + 1) % lc["val_period"] == 0:
             eval_model = ema.ema if ema else model
-            val_metrics = validate(eval_model, val_loader, device, str(data_root / dc["val_ann"]), amp_enabled=amp_enabled)
+            val_metrics = validate(
+                eval_model, val_loader, device, str(data_root / dc["val_ann"]),
+                img_size=cfg["model"]["img_size"], amp_enabled=amp_enabled,
+                writer=writer, epoch=epoch,
+            )
             for k, v in val_metrics.items():
                 writer.add_scalar(f"val/{k}", v, epoch)
             print_val_metrics(epoch, tc["epochs"], val_metrics)
