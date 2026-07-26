@@ -444,25 +444,46 @@ def main() -> None:
 
     save_dir = Path(lc["save_dir"]) / lc["project"]
     save_dir.mkdir(parents=True, exist_ok=True)
-    writer = SummaryWriter(save_dir / "tb")
 
     start_epoch = 0
     best_map = 0.0
+    resumed_keys: list[str] = []
 
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device)
         model.load_state_dict(ckpt["model"])
-        optimizer.load_state_dict(ckpt["optimizer"])
+        resumed_keys.append("model")
+        if "optimizer" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer"])
+            resumed_keys.append("optimizer")
         if "scheduler" in ckpt:
             scheduler.load_state_dict(ckpt["scheduler"])
+            resumed_keys.append("scheduler")
+        if ema is not None and "ema" in ckpt:
+            ema.ema.load_state_dict(ckpt["ema"])
+            resumed_keys.append("ema")
+        if scaler is not None and scaler.is_enabled() and "scaler" in ckpt:
+            scaler.load_state_dict(ckpt["scaler"])
+            resumed_keys.append("scaler")
         start_epoch = ckpt["epoch"] + 1
         best_map = ckpt.get("best_map", 0.0)
-        print(f"Resumed from epoch {start_epoch}")
 
-    print(f"  Workers    {num_workers}")
-    print(f"  Save dir   {save_dir}")
+    # Each run attempt (fresh start, or a resume from a given epoch) gets its own
+    # TensorBoard subdirectory, so resuming from a checkpoint that isn't the most
+    # recent epoch doesn't interleave/overwrite scalars from the previous attempt.
+    run_tag = "scratch" if start_epoch == 0 else f"resume_ep{start_epoch}"
+    run_dir = save_dir / "tb" / run_tag
+    suffix = 1
+    while run_dir.exists():
+        suffix += 1
+        run_dir = save_dir / "tb" / f"{run_tag}_{suffix}"
+    writer = SummaryWriter(run_dir)
+
+    print(f"  Workers      {num_workers}")
+    print(f"  Save dir     {save_dir}")
+    print(f"  TensorBoard  {run_dir}")
     if args.resume:
-        print(f"  Resuming   epoch {start_epoch} → {tc['epochs']}")
+        print(f"  Resumed      epoch {start_epoch} → {tc['epochs']}  (restored: {', '.join(resumed_keys)})")
     print()
     print_epoch_header()
 
@@ -499,24 +520,25 @@ def main() -> None:
 
             if val_metrics["mAP"] > best_map:
                 best_map = val_metrics["mAP"]
-                torch.save({"model": model.state_dict(), "epoch": epoch, "best_map": best_map}, save_dir / "best.pt")
+                # Save the weights that actually earned this score (the EMA shadow,
+                # when enabled — validate() evaluates eval_model, not the raw model).
+                torch.save({"model": eval_model.state_dict(), "epoch": epoch, "best_map": best_map}, save_dir / "best.pt")
 
-        torch.save({
+        ckpt_data = {
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
             "epoch": epoch,
             "best_map": best_map,
-        }, save_dir / "last.pt")
+        }
+        if ema is not None:
+            ckpt_data["ema"] = ema.ema.state_dict()
+        if scaler is not None and scaler.is_enabled():
+            ckpt_data["scaler"] = scaler.state_dict()
 
+        torch.save(ckpt_data, save_dir / "last.pt")
         if (epoch + 1) % lc["save_period"] == 0:
-            torch.save({
-                "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "scheduler": scheduler.state_dict(),
-                "epoch": epoch,
-                "best_map": best_map,
-            }, save_dir / f"epoch_{epoch}.pt")
+            torch.save(ckpt_data, save_dir / f"epoch_{epoch}.pt")
 
     print(_hline(_EW, "└", "┴", "┘"))
     writer.close()
