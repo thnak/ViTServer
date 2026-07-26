@@ -256,7 +256,8 @@ def _cells(vals, widths) -> str:
 
 
 def print_run_header(
-    cfg: dict, args: argparse.Namespace, model: nn.Module, device: torch.device
+    cfg: dict, args: argparse.Namespace, model: nn.Module, device: torch.device,
+    n_train: int, n_val: int,
 ) -> None:
     mc, tc = cfg["model"], cfg["training"]
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
@@ -272,6 +273,7 @@ def print_run_header(
         ("encoder_type",   mc.get("encoder_type", "none")),
         ("decoder_layers", str(mc["num_decoder_layers"])),
         ("parameters",     f"{n_params:.2f} M"),
+        ("train_imgs",     str(n_train)),
     ]
     right = [
         ("epochs",         str(tc["epochs"])),
@@ -283,6 +285,7 @@ def print_run_header(
         ("ema",            str(tc["ema"])),
         ("warmup",         f"{tc['warmup_epochs']} ep"),
         ("compile",        compile_str),
+        ("val_imgs",       str(n_val)),
     ]
     while len(left) < len(right): left.append(("", ""))
     while len(right) < len(left): right.append(("", ""))
@@ -404,7 +407,11 @@ def main() -> None:
         )
 
     model, criterion = build_model_and_criterion(cfg, device)
-    print_run_header(cfg, args, model, device)
+    print_run_header(
+        cfg, args, model, device,
+        n_train=len(train_loader.dataset),
+        n_val=len(val_loader.dataset) if val_loader is not None else 0,
+    )
 
     if args.compile and device.type == "cuda":
         import platform
@@ -452,9 +459,7 @@ def main() -> None:
         best_map = ckpt.get("best_map", 0.0)
         print(f"Resumed from epoch {start_epoch}")
 
-    n_train = len(train_loader.dataset)
-    n_val   = len(val_loader.dataset) if val_loader else 0
-    print(f"  Dataset    train {n_train:,}  │  val {n_val:,}  │  workers {num_workers}")
+    print(f"  Workers    {num_workers}")
     print(f"  Save dir   {save_dir}")
     if args.resume:
         print(f"  Resuming   epoch {start_epoch} → {tc['epochs']}")
