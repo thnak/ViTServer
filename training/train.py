@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import math
+import sys
 from copy import deepcopy
 from pathlib import Path
 from typing import Callable, Optional
@@ -290,6 +291,10 @@ def print_val_metrics(epoch: int, total: int, metrics: dict) -> None:
 def main() -> None:
     args = parse_args()
     device, mark_step_fn = _resolve_device(args.device)
+
+    # Fix Windows cp1252 encoding for redirected stdout (Unicode box-drawing chars)
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
     # ── GPU optimizations ────────────────────────────────────────────────
     if device.type == "cuda":
