@@ -181,6 +181,16 @@ def train_one_epoch(
             losses = criterion(outputs, targets)
 
         loss = losses["total"] / grad_accum
+        if not torch.isfinite(loss):
+            # A non-finite loss (e.g. AMP fp16 overflow feeding NaN into the matcher/
+            # loss) would otherwise corrupt every weight it touches on backward — worse
+            # when AMP is off, since GradScaler's automatic inf/nan skip doesn't apply.
+            # Skip this micro-batch's backward entirely (don't touch .grad — with
+            # grad_accum > 1 there may be valid accumulated gradients from earlier
+            # micro-batches in this window that must survive).
+            print(f"[train_one_epoch] non-finite loss ({loss.item()}) at epoch {epoch} step {step} — skipping")
+            continue
+
         if scaler is not None:
             scaler.scale(loss).backward()
         else:

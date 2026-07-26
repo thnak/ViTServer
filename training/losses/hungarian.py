@@ -16,6 +16,7 @@ Key design decisions (DETR-style):
 
 from __future__ import annotations
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -122,6 +123,14 @@ class HungarianMatcher(nn.Module):
 
             if M > 0:
                 c = cost_cpu[b, :, :M].numpy()
+                if not np.isfinite(c).all():
+                    # A non-finite pred_box/logit (e.g. AMP fp16 overflow) reached the
+                    # cost matrix — scipy raises on this. Clamp to a large-but-finite
+                    # penalty so matching degrades gracefully instead of crashing the
+                    # whole run; the loss for this sample will still reflect the bad
+                    # prediction (and train_one_epoch skips the step if it's non-finite).
+                    print(f"[HungarianMatcher] non-finite cost entries in batch item {b} — clamping")
+                    c = np.nan_to_num(c, nan=1e6, posinf=1e6, neginf=-1e6)
                 row, col = linear_sum_assignment(c)
                 k = len(row)
                 pi_pad[:k] = torch.as_tensor(row, dtype=torch.long)
